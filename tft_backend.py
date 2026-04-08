@@ -261,11 +261,11 @@ DEFAULTS = {
     # Timing  (Human mode defaults)
     "roll_delay":    1.5,
     "pre_delay":     1,
-    "shop_wait":     0.15,
-    "buy_delay":     0.05,
+    "shop_wait":     0.05,
+    "buy_delay":     0.02,
 
     # OCR
-    "ocr_threshold": 0.50,
+    "ocr_threshold": 0.70,
 
     # Positions — initialised below from position.yaml (1920×1080 as fallback)
     "click_pos":    [[575, 992], [775, 992], [975, 992], [1175, 992], [1375, 992]],

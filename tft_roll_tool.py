@@ -504,7 +504,8 @@ class TFTRollTool(QMainWindow):
         esc_hint.setStyleSheet("color:#555;font-size:10px;margin-left:2px;")
         rl3.addWidget(esc_hint)
 
-        # Overlay toggle
+        # Overlay toggle + auto-show option
+        overlay_row = QHBoxLayout(); overlay_row.setSpacing(8)
         self._overlay_btn = QPushButton("📌  Show Log Overlay")
         self._overlay_btn.setFixedHeight(30)
         self._overlay_btn.setCheckable(True)
@@ -515,7 +516,18 @@ class TFTRollTool(QMainWindow):
             "QPushButton:hover{background:#2a2a4e;}"
         )
         self._overlay_btn.clicked.connect(self._toggle_overlay)
-        rl3.addWidget(self._overlay_btn)
+
+        self._auto_overlay_cb = QCheckBox("Auto-show on start")
+        self._auto_overlay_cb.setChecked(True)
+        self._auto_overlay_cb.setStyleSheet("color:#8b949e;font-size:10px;")
+        self._auto_overlay_cb.setToolTip(
+            "When checked, the log overlay is shown automatically\n"
+            "whenever rolling or auto-capture starts."
+        )
+        overlay_row.addWidget(self._overlay_btn)
+        overlay_row.addWidget(self._auto_overlay_cb)
+        overlay_row.addStretch()
+        rl3.addLayout(overlay_row)
 
         tip = QLabel("Move mouse to top-left corner to emergency stop.")
         tip.setStyleSheet("color:#555;font-size:10px;")
@@ -951,10 +963,10 @@ class TFTRollTool(QMainWindow):
     def _apply_mode_preset(self):
         """Apply Human or BOT timing presets to the spinboxes."""
         if self._mode_human.isChecked():
-            self._shop_wait_sp.setValue(0.15)
-            self._buy_delay_sp.setValue(0.05)
+            self._shop_wait_sp.setValue(0.05)
+            self._buy_delay_sp.setValue(0.02)
         else:
-            self._shop_wait_sp.setValue(0.10)
+            self._shop_wait_sp.setValue(0.05)
             self._buy_delay_sp.setValue(0.005)
 
     def _save_settings(self):
@@ -983,7 +995,7 @@ class TFTRollTool(QMainWindow):
     def _reset_settings(self):
         self._mode_human.setChecked(True)
         self._pre_sp.setValue(1)
-        self._ocr_thr_sp.setValue(0.50)
+        self._ocr_thr_sp.setValue(0.70)
         self._res_combo.setCurrentText("1920x1080")
         self._settings_status.setText("↺ Reset to defaults. Click Save to apply.")
 
@@ -1035,7 +1047,18 @@ class TFTRollTool(QMainWindow):
     #  Automation
     # ─────────────────────────────────────────────────────────
 
+    def _show_overlay_if_auto(self) -> None:
+        """Show the log overlay automatically if the auto-show option is enabled."""
+        if self._auto_overlay_cb.isChecked() and not self._overlay.isVisible():
+            screen = QApplication.primaryScreen().availableGeometry()
+            self._overlay.move(screen.right() - self._overlay.width() - 20,
+                               screen.top() + 80)
+            self._overlay.show()
+            self._overlay_btn.setText("📌  Hide Log Overlay")
+            self._overlay_btn.setChecked(True)
+
     def _start(self):
+        self._show_overlay_if_auto()
         self._log.clear()
         cfg = {
             "pre_delay":     self._pre_sp.value(),
@@ -1152,11 +1175,11 @@ class TFTRollTool(QMainWindow):
         self._train_thr_sp = QDoubleSpinBox()
         self._train_thr_sp.setRange(0.50, 1.00)
         self._train_thr_sp.setSingleStep(0.01)
-        self._train_thr_sp.setValue(0.90)
+        self._train_thr_sp.setValue(0.99)
         self._train_thr_sp.setFixedWidth(72)
         self._train_thr_sp.setToolTip(
             "Score range: 0.0 (no match) – 1.0 (identical).\n"
-            "Recommended ≥0.90 for training so only high-confidence\n"
+            "Recommended ≥0.99 for training so only high-confidence\n"
             "OCR results are saved to the hash map."
         )
         hm_row.addWidget(self._train_thr_sp)
@@ -1299,6 +1322,7 @@ class TFTRollTool(QMainWindow):
 
     def _train_toggle_auto(self, checked: bool):
         if checked:
+            self._show_overlay_if_auto()
             self._btn_auto_cap.setText("■  Stop Auto Capture")
             cfg = {
                 "capture_interval": self._cap_interval_sp.value(),

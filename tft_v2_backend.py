@@ -155,12 +155,15 @@ class HashMapper:
         with self._lock:
             return self._hash_to_name.get(h)
 
-    def update(self, h: str, name: str, slot: int) -> str | None:
+    def update(self, h: str, name: str, slot: int, score: float = 0.0) -> str | None:
         """
         Register a hash for a specific slot+name.
         Key format: "{slot}_{name}"  e.g. "1_Jinx"
-        Returns a conflict warning string if the key already has a different hash,
-        otherwise returns None.
+
+        Conflict rules (existing key, different hash):
+          score >= 0.99 → overwrite stored hash (high-confidence new observation).
+          score <  0.99 → keep stored hash and return a warning string.
+        Returns None when there is nothing to warn about.
         """
         key      = f"{slot}_{name}"
         changed  = False
@@ -174,11 +177,25 @@ class HashMapper:
                 self._hash_to_name[h] = name
                 changed = True
             elif existing != h:
-                # Same slot+name, different hash → conflict
-                conflict = (
-                    f"[HashMapper] CONFLICT '{key}': "
-                    f"stored={existing[:8]} new={h[:8]} — keeping stored hash."
-                )
+                if score >= 0.99:
+                    # High-confidence new observation — overwrite stored hash
+                    old_h = existing
+                    self._key_to_hash[key] = h
+                    self._hash_to_name[h]  = name
+                    # Clean up old reverse-index entry if no other key uses it
+                    if old_h not in self._key_to_hash.values():
+                        self._hash_to_name.pop(old_h, None)
+                    changed  = True
+                    conflict = (
+                        f"[HashMapper] OVERWRITE '{key}': "
+                        f"old={existing[:8]} new={h[:8]} (score={score:.2f} ≥ 0.99)"
+                    )
+                else:
+                    # Low-confidence — keep stored hash
+                    conflict = (
+                        f"[HashMapper] CONFLICT '{key}': "
+                        f"stored={existing[:8]} new={h[:8]} (score={score:.2f} < 0.99) — keeping stored."
+                    )
             # existing == h → already known, no-op
         if changed:
             _async_pool.submit(self.save)
@@ -260,7 +277,7 @@ def lookup_or_ocr(gray: np.ndarray, slot: int, threshold: float,
     result["hash_conflict"]  = None
     result["normalized"]     = normalized
     if result["match"]:
-        conflict = _hashmap.update(h, result["match"], slot)
+        conflict = _hashmap.update(h, result["match"], slot, result["score"])
         if conflict:
             print(conflict)
             result["hash_conflict"] = conflict
