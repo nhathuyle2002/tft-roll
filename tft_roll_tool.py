@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QScrollArea, QFrame, QGridLayout,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
     QTextEdit, QSizePolicy, QFileDialog, QButtonGroup, QRadioButton,
+    QComboBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QBrush, QColor
@@ -21,12 +22,13 @@ from tft_backend import (
     OCR_AVAILABLE,
     TFT_UNITS, COST_COLOR, COST_BG, COST_LABEL,
     DEFAULTS,
+    load_positions, save_positions, load_app_settings, save_app_settings,
     ocr_all_slots, ocr_from_image_file,
 )
 from tft_v2_backend import (
     RollWorkerV2, AutoCaptureWorker,
     capture_once, run_train_on_image,
-    get_hashmap, HASHMAP_PATH, TRAIN_DIR,
+    get_hashmap, hashmap_path, set_active_resolution, TRAIN_DIR,
 )
 
 
@@ -303,6 +305,16 @@ class TFTRollTool(QMainWindow):
         self._train_img_path: str | None = None
         self._cap_thread:     _CaptureThread | None = None
 
+        # Load persisted resolution and activate matching hashmap + positions
+        _saved = load_app_settings()
+        _res_str = _saved.get("resolution", "1920x1080")
+        try:
+            _rw, _rh = (int(v) for v in _res_str.split("x", 1))
+        except ValueError:
+            _rw, _rh = 1920, 1080
+        self._active_res: tuple[int, int] = (_rw, _rh)
+        set_active_resolution(_rw, _rh)
+
         # Floating log overlay (always-on-top)
         self._overlay = LogOverlay()
         self._overlay.hide()
@@ -527,18 +539,82 @@ class TFTRollTool(QMainWindow):
         return w
 
     # ─────────────────────────────────────────────────────────
-    #  Settings tab  (all timing + screen position controls)
+    #  Settings tab
     # ─────────────────────────────────────────────────────────
+
+    # Predefined resolution options shown in the dropdown
+    _PRESET_RESOLUTIONS = [
+        "1280x720",
+        "1366x768",
+        "1600x900",
+        "1920x1080",
+        "2560x1440",
+        "3840x2160",
+        "Custom…",
+    ]
 
     def _tab_settings(self) -> QWidget:
         w = QWidget()
         outer = QVBoxLayout(w); outer.setContentsMargins(10, 10, 10, 10)
 
-        # Scrollable so it fits any window height
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
         sc.setStyleSheet("QScrollArea{background:transparent;}")
         inner = QWidget(); lay = QVBoxLayout(inner)
         lay.setAlignment(Qt.AlignTop); lay.setSpacing(6)
+
+        # ── Resolution ────────────────────────────────────────
+        lay.addWidget(self._sh("🖥  Display Resolution"))
+
+        res_row = QHBoxLayout(); res_row.setSpacing(8)
+        res_lbl = QLabel("Resolution:"); res_lbl.setFixedWidth(160)
+
+        self._res_combo = QComboBox()
+        self._res_combo.addItems(self._PRESET_RESOLUTIONS)
+        self._res_combo.setFixedWidth(160)
+        self._res_combo.setStyleSheet(
+            "QComboBox{background:#1a1a2e;color:#ccc;border:1px solid #444;"
+            "border-radius:4px;padding:3px 8px;}"
+            "QComboBox::drop-down{border:none;}"
+            "QComboBox QAbstractItemView{background:#1a1a2e;color:#ccc;selection-background-color:#2a3a5a;}"
+        )
+
+        # Custom resolution spinboxes (only visible when "Custom…" is selected)
+        self._custom_w_sp = QSpinBox()
+        self._custom_w_sp.setRange(640, 7680); self._custom_w_sp.setValue(1920)
+        self._custom_w_sp.setPrefix("W: "); self._custom_w_sp.setFixedWidth(100)
+
+        self._custom_h_sp = QSpinBox()
+        self._custom_h_sp.setRange(480, 4320); self._custom_h_sp.setValue(1080)
+        self._custom_h_sp.setPrefix("H: "); self._custom_h_sp.setFixedWidth(100)
+
+        # Initialise combo to match saved resolution
+        saved_key = f"{self._active_res[0]}x{self._active_res[1]}"
+        if saved_key in self._PRESET_RESOLUTIONS:
+            self._res_combo.setCurrentText(saved_key)
+        else:
+            self._res_combo.setCurrentText("Custom…")
+            self._custom_w_sp.setValue(self._active_res[0])
+            self._custom_h_sp.setValue(self._active_res[1])
+
+        self._custom_w_sp.setVisible(self._res_combo.currentText() == "Custom…")
+        self._custom_h_sp.setVisible(self._res_combo.currentText() == "Custom…")
+
+        self._res_combo.currentTextChanged.connect(self._on_res_combo_changed)
+
+        res_row.addWidget(res_lbl)
+        res_row.addWidget(self._res_combo)
+        res_row.addWidget(self._custom_w_sp)
+        res_row.addWidget(self._custom_h_sp)
+        res_row.addStretch()
+        lay.addLayout(res_row)
+
+        res_note = QLabel(
+            "Each resolution uses its own hash map (hashmap_W_H.json).  "
+            "Train Mode always captures at the resolution selected here."
+        )
+        res_note.setStyleSheet("color:#555;font-size:10px;margin-bottom:4px;")
+        res_note.setWordWrap(True)
+        lay.addWidget(res_note)
 
         # ── Timing ────────────────────────────────────────────
         lay.addWidget(self._sh("⏱  Timing"))
@@ -560,42 +636,14 @@ class TFTRollTool(QMainWindow):
             "OCR match threshold  (higher = stricter matching, 0.62 recommended)"
         )
         for label, spin in [
-            ("Start delay:",         self._pre_sp),
-            ("Shop load wait:",      self._shop_wait_sp),
-            ("Buy speed:",           self._buy_delay_sp),
-            ("OCR threshold:",       self._ocr_thr_sp),
+            ("Start delay:",    self._pre_sp),
+            ("Shop load wait:", self._shop_wait_sp),
+            ("Buy speed:",      self._buy_delay_sp),
+            ("OCR threshold:",  self._ocr_thr_sp),
         ]:
             r = QHBoxLayout()
             lbl = QLabel(label); lbl.setFixedWidth(160)
             r.addWidget(lbl); r.addWidget(spin); r.addStretch()
-            lay.addLayout(r)
-
-        # ── Click positions ───────────────────────────────────
-        lay.addWidget(self._sh("🖱  Click Positions  (center of each shop card)"))
-        self._click_spins: list[tuple[QSpinBox, QSpinBox]] = []
-        for i, (x, y) in enumerate(DEFAULTS["click_pos"]):
-            r = QHBoxLayout()
-            r.addWidget(self._slot_lbl(i))
-            xs = QSpinBox(); xs.setRange(0, 3840); xs.setValue(x)
-            xs.setPrefix("X: "); xs.setFixedWidth(100)
-            ys = QSpinBox(); ys.setRange(0, 2160); ys.setValue(y)
-            ys.setPrefix("Y: "); ys.setFixedWidth(100)
-            self._click_spins.append((xs, ys))
-            r.addWidget(xs); r.addWidget(ys); r.addStretch()
-            lay.addLayout(r)
-
-        # ── OCR name regions ──────────────────────────────────
-        lay.addWidget(self._sh("🔍  OCR Name Regions  [x, y, w, h] of unit-name text per slot"))
-        self._name_spins: list[tuple[QSpinBox, QSpinBox, QSpinBox, QSpinBox]] = []
-        for i, (x, y, rw, rh) in enumerate(DEFAULTS["name_regions"]):
-            r = QHBoxLayout()
-            r.addWidget(self._slot_lbl(i))
-            xs = QSpinBox(); xs.setRange(0, 3840); xs.setValue(x);  xs.setPrefix("X:"); xs.setFixedWidth(88)
-            ys = QSpinBox(); ys.setRange(0, 2160); ys.setValue(y);  ys.setPrefix("Y:"); ys.setFixedWidth(88)
-            ws = QSpinBox(); ws.setRange(10, 400); ws.setValue(rw); ws.setPrefix("W:"); ws.setFixedWidth(84)
-            hs = QSpinBox(); hs.setRange(4, 100);  hs.setValue(rh); hs.setPrefix("H:"); hs.setFixedWidth(76)
-            self._name_spins.append((xs, ys, ws, hs))
-            r.addWidget(xs); r.addWidget(ys); r.addWidget(ws); r.addWidget(hs); r.addStretch()
             lay.addLayout(r)
 
         # ── Buttons ───────────────────────────────────────────
@@ -629,18 +677,25 @@ class TFTRollTool(QMainWindow):
         self._settings_status.setStyleSheet("color:#58a6ff;font-size:11px;")
         lay.addWidget(self._settings_status)
 
-        note = QLabel(
-            "Default values target 1920×1080 fullscreen TFT.  "
-            "For other resolutions, hover your mouse over each shop slot in-game "
-            "and read the coordinates from ShareX or Windows Snipping Tool."
-        )
-        note.setStyleSheet("color:#555;font-size:10px;margin-top:4px;")
-        note.setWordWrap(True)
-        lay.addWidget(note)
-
         sc.setWidget(inner)
         outer.addWidget(sc)
         return w
+
+    def _on_res_combo_changed(self, text: str) -> None:
+        custom = text == "Custom…"
+        self._custom_w_sp.setVisible(custom)
+        self._custom_h_sp.setVisible(custom)
+
+    def _active_res_from_ui(self) -> tuple[int, int]:
+        """Read the currently selected resolution from the settings UI."""
+        txt = self._res_combo.currentText()
+        if txt == "Custom…":
+            return self._custom_w_sp.value(), self._custom_h_sp.value()
+        try:
+            w, h = (int(v) for v in txt.split("x", 1))
+            return w, h
+        except ValueError:
+            return 1920, 1080
 
     # ─────────────────────────────────────────────────────────
     #  OCR Test tab  (upload image → OCR → inspect results)
@@ -897,33 +952,33 @@ class TFTRollTool(QMainWindow):
             self._buy_delay_sp.setValue(0.005)
 
     def _save_settings(self):
-        for i, (xs, ys) in enumerate(self._click_spins):
-            DEFAULTS["click_pos"][i] = [xs.value(), ys.value()]
-        for i, (xs, ys, ws, hs) in enumerate(self._name_spins):
-            DEFAULTS["name_regions"][i] = [
-                xs.value(), ys.value(), ws.value(), hs.value()
-            ]
-        self._settings_status.setText("✓ Settings saved.")
+        # Timing
+        DEFAULTS["pre_delay"]     = self._pre_sp.value()
+        DEFAULTS["shop_wait"]     = self._shop_wait_sp.value()
+        DEFAULTS["buy_delay"]     = self._buy_delay_sp.value()
+        DEFAULTS["ocr_threshold"] = self._ocr_thr_sp.value()
+
+        # Resolution — switch hashmap + positions, persist to settings.json
+        rw, rh = self._active_res_from_ui()
+        self._active_res = (rw, rh)
+        set_active_resolution(rw, rh)
+        save_app_settings({"resolution": f"{rw}x{rh}"})
+
+        # Write to position.yaml if this resolution wasn't already there
+        save_positions(rw, rh, {"click_pos":    DEFAULTS["click_pos"],
+                                "name_regions": DEFAULTS["name_regions"]})
+
+        self._train_refresh_hm()
+        self._settings_status.setText(
+            f"✓ Settings saved  ({rw}×{rh}, "
+            f"{get_hashmap().size} hash entries)."
+        )
 
     def _reset_settings(self):
-        self._mode_human.setChecked(True)   # resets timing via _apply_mode_preset
-        self._pre_sp.setValue(3)
+        self._mode_human.setChecked(True)
+        self._pre_sp.setValue(1)
         self._ocr_thr_sp.setValue(0.50)
-
-        defaults_click = [
-            [575, 992], [775, 992], [975, 992], [1175, 992], [1375, 992]
-        ]
-        defaults_name = [
-            [480, 1045, 145, 20], [685, 1045, 145, 20], [885, 1045, 145, 20],
-            [1085, 1045, 145, 20], [1290, 1045, 145, 20]
-        ]
-        for i, (xs, ys) in enumerate(self._click_spins):
-            xs.setValue(defaults_click[i][0])
-            ys.setValue(defaults_click[i][1])
-        for i, (xs, ys, ws, hs) in enumerate(self._name_spins):
-            xs.setValue(defaults_name[i][0]); ys.setValue(defaults_name[i][1])
-            ws.setValue(defaults_name[i][2]); hs.setValue(defaults_name[i][3])
-
+        self._res_combo.setCurrentText("1920x1080")
         self._settings_status.setText("↺ Reset to defaults. Click Save to apply.")
 
     # ─────────────────────────────────────────────────────────
@@ -1169,7 +1224,7 @@ class TFTRollTool(QMainWindow):
         hm.load()
         n = hm.size
         self._hm_lbl.setText(
-            f"Hashmap: {n} entr{'y' if n == 1 else 'ies'}  ·  {HASHMAP_PATH.name}"
+            f"Hashmap: {n} entr{'y' if n == 1 else 'ies'}  ·  {hm._path.name}"
         )
 
     def _train_browse(self):

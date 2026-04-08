@@ -3,11 +3,138 @@ tft_backend.py — Game data, input layer, OCR helpers, worker thread.
 Imported by tft_roll_tool.py (UI) and usable standalone / in tests.
 """
 
+import json
 import time
 import difflib
 import ctypes
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+try:
+    import yaml as _yaml
+    _YAML_OK = True
+except ImportError:
+    _yaml = None
+    _YAML_OK = False
+
+_ROOT             = Path(__file__).parent
+POSITIONS_PATH    = _ROOT / "position.yaml"
+APP_SETTINGS_PATH = _ROOT / "settings.json"
+
+# Base positions calibrated at 1920×1080 fullscreen TFT.
+# ⚠️  REFERENCE CONSTANTS — do NOT change or recalculate these values.
+#    They are the hand-calibrated source-of-truth from annotated screenshots.
+#    All other resolutions are proportionally derived from them.
+#    If recalibration is ever needed, update these constants AND the
+#    1920x1080 block in position.yaml together.
+_BASE_W = 1920
+_BASE_H = 1080
+_BASE_CLICK_POS = [
+    [575, 992], [775, 992], [975, 992], [1175, 992], [1375, 992],
+]
+_BASE_NAME_REGIONS = [
+    [480, 1045, 145, 20], [685, 1045, 145, 20], [885, 1045, 145, 20],
+    [1085, 1045, 145, 20], [1290, 1045, 145, 20],
+]
+
+
+def _scale_positions(w: int, h: int) -> dict:
+    """Proportionally scale base 1920×1080 positions to (w, h)."""
+    sx, sy = w / _BASE_W, h / _BASE_H
+    return {
+        "click_pos": [[round(x * sx), round(y * sy)] for x, y in _BASE_CLICK_POS],
+        "name_regions": [
+            [round(rx * sx), round(ry * sy), max(1, round(rw * sx)), max(1, round(rh * sy))]
+            for rx, ry, rw, rh in _BASE_NAME_REGIONS
+        ],
+    }
+
+
+def load_positions(w: int, h: int) -> dict:
+    """
+    Return click_pos + name_regions for the given resolution.
+    Reads from position.yaml first; falls back to proportional scaling.
+    """
+    key = f"{w}x{h}"
+    if _YAML_OK and POSITIONS_PATH.exists():
+        try:
+            with open(POSITIONS_PATH, "r", encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            if key in data:
+                res = data[key]
+                click_pos    = [[res[f"slot_{i+1}"]["click_position"]["x"],
+                                  res[f"slot_{i+1}"]["click_position"]["y"]] for i in range(5)]
+                name_regions = [[res[f"slot_{i+1}"]["unit_name_region"]["x"],
+                                  res[f"slot_{i+1}"]["unit_name_region"]["y"],
+                                  res[f"slot_{i+1}"]["unit_name_region"]["w"],
+                                  res[f"slot_{i+1}"]["unit_name_region"]["h"]] for i in range(5)]
+                return {"click_pos": click_pos, "name_regions": name_regions}
+        except Exception:
+            pass
+    return _scale_positions(w, h)
+
+
+def save_positions(w: int, h: int, positions: dict) -> None:
+    """
+    Persist click_pos + name_regions for (w, h) into position.yaml.
+    Existing entries for other resolutions are preserved.
+
+    NOTE: The 1920×1080 entry is the hand-calibrated reference and is
+    intentionally protected — this function will never overwrite it.
+    Recalibration must be done manually in _BASE_CLICK_POS / _BASE_NAME_REGIONS
+    (tft_backend.py) and in position.yaml simultaneously.
+    """
+    if not _YAML_OK:
+        return
+    key = f"{w}x{h}"
+    # Guard: 1920×1080 is the canonical reference — never auto-overwrite it.
+    if key == "1920x1080":
+        return
+    data: dict = {}
+    if POSITIONS_PATH.exists():
+        try:
+            with open(POSITIONS_PATH, "r", encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+        except Exception:
+            pass
+    entry: dict = {}
+    for i, ((cx, cy), (rx, ry, rw, rh)) in enumerate(
+        zip(positions["click_pos"], positions["name_regions"])
+    ):
+        entry[f"slot_{i+1}"] = {
+            "click_position":   {"x": cx, "y": cy},
+            "unit_name_region": {"x": rx, "y": ry, "w": rw, "h": rh},
+        }
+    data[key] = entry
+    with open(POSITIONS_PATH, "w", encoding="utf-8") as fh:
+        _yaml.dump(data, fh, default_flow_style=None, sort_keys=True, allow_unicode=True)
+
+
+def load_app_settings() -> dict:
+    """Load persisted app settings (e.g. last-used resolution). Returns {} if missing."""
+    if APP_SETTINGS_PATH.exists():
+        try:
+            with open(APP_SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return {}
+
+
+def save_app_settings(data: dict) -> None:
+    """Persist app settings to settings.json."""
+    try:
+        existing: dict = {}
+        if APP_SETTINGS_PATH.exists():
+            with open(APP_SETTINGS_PATH, "r", encoding="utf-8") as fh:
+                existing = json.load(fh)
+        existing.update(data)
+        with open(APP_SETTINGS_PATH, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
 
 # ── Windows-only input layer ──────────────────────────────────────────────────
 # On macOS/Linux the app still launches for UI testing; input calls are no-ops.
@@ -127,34 +254,30 @@ COST_LABEL = {1: "● Cost 1", 2: "●● Cost 2", 3: "●●● Cost 3",
               4: "◆◆◆◆ Cost 4", 5: "◆◆◆◆◆ Cost 5"}
 
 
-# ── Defaults (1920×1080 fullscreen) ──────────────────────────────────────────
+# ── Runtime defaults ──────────────────────────────────────────────────────────
+# Timing values are static; click_pos / name_regions are overwritten at startup
+# by load_positions() for the active resolution (default 1920×1080).
 DEFAULTS = {
-    # Timing  (Human mode defaults — ~0.3s RTT)
-    "roll_delay":    1.5,   # seconds between each D press (auto roll)
-    "pre_delay":     1,     # countdown before automation starts
-    "shop_wait":     0.15,  # seconds to wait after rolling for shop to load
-    "buy_delay":     0.05,  # seconds between clicking each shop slot
+    # Timing  (Human mode defaults)
+    "roll_delay":    1.5,
+    "pre_delay":     1,
+    "shop_wait":     0.15,
+    "buy_delay":     0.05,
 
     # OCR
     "ocr_threshold": 0.50,
 
-    # Click centers — each shop card (x, y)
-    "click_pos": [
-        [575,  992],
-        [775,  992],
-        [975,  992],
-        [1175, 992],
-        [1375, 992],
-    ],
-    # Name-text crop regions [x, y, w, h] — calibrated from annotated screenshots
-    "name_regions": [
-        [480,  1045, 145, 20],
-        [685,  1045, 145, 20],
-        [885,  1045, 145, 20],
-        [1085, 1045, 145, 20],
-        [1290, 1045, 145, 20],
-    ],
+    # Positions — initialised below from position.yaml (1920×1080 as fallback)
+    "click_pos":    [[575, 992], [775, 992], [975, 992], [1175, 992], [1375, 992]],
+    "name_regions": [[480, 1045, 145, 20], [685, 1045, 145, 20],
+                     [885, 1045, 145, 20], [1085, 1045, 145, 20],
+                     [1290, 1045, 145, 20]],
 }
+
+# Populate positions from yaml immediately so importers get the right values.
+_pos_init = load_positions(1920, 1080)
+DEFAULTS["click_pos"]    = _pos_init["click_pos"]
+DEFAULTS["name_regions"] = _pos_init["name_regions"]
 
 
 # ── OCR helpers ───────────────────────────────────────────────────────────────

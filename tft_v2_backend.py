@@ -43,9 +43,14 @@ from tft_backend import (
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
-_ROOT        = Path(__file__).parent
-HASHMAP_PATH = _ROOT / "hashmap.json"
-TRAIN_DIR    = _ROOT / "train"
+_ROOT     = Path(__file__).parent
+TRAIN_DIR = _ROOT / "train"
+
+
+def hashmap_path(w: int, h: int) -> Path:
+    """Return the hashmap file path for a given display resolution."""
+    return _ROOT / f"hashmap_{w}_{h}.json"
+
 
 # Shared pool for fire-and-forget async work (hashmap saves, hash updates)
 _async_pool = ThreadPoolExecutor(max_workers=2)
@@ -97,7 +102,7 @@ def compute_hash(normalized: np.ndarray) -> str:
 
 class HashMapper:
     """
-    Thread-safe store backed by hashmap.json.
+    Thread-safe store backed by hashmap_<w>_<h>.json (one file per resolution).
 
     Storage format (JSON):  { "<slot>_<unit_name>": hash_value }  — sorted A→Z by key.
     In-memory reverse index: { hash_value: unit_name }  — for O(1) roll-time lookup.
@@ -109,17 +114,18 @@ class HashMapper:
         This catches normalisation drift between game patches or monitor settings.
     """
 
-    def __init__(self):
-        self._key_to_hash:  dict[str, str] = {}   # "{slot}_{name}" → hash, persisted
-        self._hash_to_name: dict[str, str] = {}   # hash → name, in-memory only
+    def __init__(self, path: Path):
+        self._path:         Path             = path
+        self._key_to_hash:  dict[str, str]   = {}   # "{slot}_{name}" → hash, persisted
+        self._hash_to_name: dict[str, str]   = {}   # hash → name, in-memory only
         self._lock = Lock()
         self.load()
 
     def load(self) -> int:
         """Reload from disk, rebuild reverse index. Returns number of entries."""
-        if HASHMAP_PATH.exists():
+        if self._path.exists():
             try:
-                with open(HASHMAP_PATH, "r", encoding="utf-8") as f:
+                with open(self._path, "r", encoding="utf-8") as f:
                     data: dict[str, str] = json.load(f)
                 reverse: dict[str, str] = {}
                 for key, h in data.items():
@@ -139,7 +145,7 @@ class HashMapper:
         with self._lock:
             snapshot = dict(self._key_to_hash)
         try:
-            with open(HASHMAP_PATH, "w", encoding="utf-8") as f:
+            with open(self._path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, ensure_ascii=False)
         except Exception:
             pass
@@ -200,12 +206,27 @@ class HashMapper:
             return list(self._key_to_hash.items())
 
 
-# Global singleton loaded once at import
-_hashmap = HashMapper()
+# Global singleton — resolution set to 1920×1080 at import time.
+# Call set_active_resolution(w, h) to switch (done by the UI on settings save).
+_hashmap = HashMapper(hashmap_path(1920, 1080))
 
 
 def get_hashmap() -> HashMapper:
     return _hashmap
+
+
+def set_active_resolution(w: int, h: int) -> None:
+    """
+    Switch the active hashmap to the one for resolution (w × h).
+    Also updates DEFAULTS click_pos / name_regions via load_positions.
+    Called by the UI whenever the user changes or saves the resolution setting.
+    """
+    from tft_backend import DEFAULTS, load_positions
+    global _hashmap
+    pos = load_positions(w, h)
+    DEFAULTS["click_pos"]    = pos["click_pos"]
+    DEFAULTS["name_regions"] = pos["name_regions"]
+    _hashmap = HashMapper(hashmap_path(w, h))
 
 
 # ── Per-slot lookup ───────────────────────────────────────────────────────────

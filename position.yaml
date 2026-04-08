@@ -1,0 +1,122 @@
+# TFT Roll Tool — Shop slot screen positions per display resolution
+# ─────────────────────────────────────────────────────────────────
+# Base calibration: 1920×1080 fullscreen (annotated screenshots)
+# Other resolutions are proportionally scaled from the base.
+#
+# ⚠️  1920×1080 entry below is the HAND-CALIBRATED REFERENCE — do NOT
+#     overwrite or recalculate it. All other resolutions are derived
+#     from these exact pixel values. If re-calibration is ever needed,
+#     update _BASE_CLICK_POS / _BASE_NAME_REGIONS in tft_backend.py
+#     AND the 1920x1080 block here together.
+#
+# Fields per slot:
+#   click_position   — center (x, y) to click to purchase a unit
+#   unit_name_region — [x, y, w, h] crop for OCR / hashing
+#
+# To add a custom resolution: run the tool, select your resolution,
+# adjust if needed, then click Save Settings — it will be appended here.
+
+1280x720:
+  slot_1:
+    click_position: {x: 383, y: 661}
+    unit_name_region: {x: 320, y: 697, w: 97, h: 13}
+  slot_2:
+    click_position: {x: 517, y: 661}
+    unit_name_region: {x: 457, y: 697, w: 97, h: 13}
+  slot_3:
+    click_position: {x: 650, y: 661}
+    unit_name_region: {x: 590, y: 697, w: 97, h: 13}
+  slot_4:
+    click_position: {x: 783, y: 661}
+    unit_name_region: {x: 723, y: 697, w: 97, h: 13}
+  slot_5:
+    click_position: {x: 917, y: 661}
+    unit_name_region: {x: 860, y: 697, w: 97, h: 13}
+
+1366x768:
+  slot_1:
+    click_position: {x: 409, y: 705}
+    unit_name_region: {x: 342, y: 743, w: 103, h: 14}
+  slot_2:
+    click_position: {x: 551, y: 705}
+    unit_name_region: {x: 487, y: 743, w: 103, h: 14}
+  slot_3:
+    click_position: {x: 694, y: 705}
+    unit_name_region: {x: 630, y: 743, w: 103, h: 14}
+  slot_4:
+    click_position: {x: 836, y: 705}
+    unit_name_region: {x: 772, y: 743, w: 103, h: 14}
+  slot_5:
+    click_position: {x: 978, y: 705}
+    unit_name_region: {x: 918, y: 743, w: 103, h: 14}
+
+1600x900:
+  slot_1:
+    click_position: {x: 479, y: 827}
+    unit_name_region: {x: 400, y: 871, w: 121, h: 17}
+  slot_2:
+    click_position: {x: 646, y: 827}
+    unit_name_region: {x: 571, y: 871, w: 121, h: 17}
+  slot_3:
+    click_position: {x: 813, y: 827}
+    unit_name_region: {x: 738, y: 871, w: 121, h: 17}
+  slot_4:
+    click_position: {x: 979, y: 827}
+    unit_name_region: {x: 904, y: 871, w: 121, h: 17}
+  slot_5:
+    click_position: {x: 1146, y: 827}
+    unit_name_region: {x: 1075, y: 871, w: 121, h: 17}
+
+# ⚠️  REFERENCE — hand-calibrated from annotated screenshots.
+#     These values are the source-of-truth for all scaled resolutions.
+#     Never overwrite with auto-scaled values.
+1920x1080:
+  slot_1:
+    click_position: {x: 575, y: 992}
+    unit_name_region: {x: 480, y: 1045, w: 145, h: 20}
+  slot_2:
+    click_position: {x: 775, y: 992}
+    unit_name_region: {x: 685, y: 1045, w: 145, h: 20}
+  slot_3:
+    click_position: {x: 975, y: 992}
+    unit_name_region: {x: 885, y: 1045, w: 145, h: 20}
+  slot_4:
+    click_position: {x: 1175, y: 992}
+    unit_name_region: {x: 1085, y: 1045, w: 145, h: 20}
+  slot_5:
+    click_position: {x: 1375, y: 992}
+    unit_name_region: {x: 1290, y: 1045, w: 145, h: 20}
+
+2560x1440:
+  slot_1:
+    click_position: {x: 767, y: 1323}
+    unit_name_region: {x: 640, y: 1393, w: 193, h: 27}
+  slot_2:
+    click_position: {x: 1033, y: 1323}
+    unit_name_region: {x: 913, y: 1393, w: 193, h: 27}
+  slot_3:
+    click_position: {x: 1300, y: 1323}
+    unit_name_region: {x: 1180, y: 1393, w: 193, h: 27}
+  slot_4:
+    click_position: {x: 1567, y: 1323}
+    unit_name_region: {x: 1447, y: 1393, w: 193, h: 27}
+  slot_5:
+    click_position: {x: 1833, y: 1323}
+    unit_name_region: {x: 1720, y: 1393, w: 193, h: 27}
+
+3840x2160:
+  slot_1:
+    click_position: {x: 1150, y: 1984}
+    unit_name_region: {x: 960, y: 2090, w: 290, h: 40}
+  slot_2:
+    click_position: {x: 1550, y: 1984}
+    unit_name_region: {x: 1370, y: 2090, w: 290, h: 40}
+  slot_3:
+    click_position: {x: 1950, y: 1984}
+    unit_name_region: {x: 1770, y: 2090, w: 290, h: 40}
+  slot_4:
+    click_position: {x: 2350, y: 1984}
+    unit_name_region: {x: 2170, y: 2090, w: 290, h: 40}
+  slot_5:
+    click_position: {x: 2750, y: 1984}
+    unit_name_region: {x: 2580, y: 2090, w: 290, h: 40}

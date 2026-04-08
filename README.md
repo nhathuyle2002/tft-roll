@@ -14,6 +14,8 @@ An automation tool for **Teamfight Tactics** that watches your shop, recognises 
 - **ESC to stop** — pressing Escape stops the tool instantly at any point during the loop (no dedicated thread; polled every 10 ms inside every wait).
 - **Log overlay** — a semi-transparent always-on-top window shows live roll count and OCR results without alt-tabbing back to the tool.
 - **Hash-first recognition (v2)** — after a unit is seen once, its name region is hashed. On every subsequent roll that slot is recognised instantly with zero Tesseract calls.
+- **Multi-resolution support** — works on any display resolution. Select your resolution in Settings; shop positions are loaded automatically from `position.yaml`. Pre-built entries: 1280×720, 1366×768, 1600×900, 1920×1080, 2560×1440, 3840×2160. Custom resolutions are auto-scaled and saved to `position.yaml` on first save.
+- **Per-resolution hash maps** — each resolution has its own `hashmap_W_H.json` (e.g. `hashmap_1920_1080.json`) so hashes trained at one resolution are never mixed with another.
 - **Train Mode (v2)** — upload screenshots or capture the live screen to build the hash map. Manual and timed auto-capture modes included.
 
 ### Platform
@@ -42,6 +44,8 @@ Download and install the Tesseract binary from [UB-Mannheim/tesseract](https://g
 pip install -r requirements.txt
 ```
 
+Dependencies: `PyQt5`, `pydirectinput`, `pytesseract`, `opencv-python`, `numpy`, `Pillow`, `pyyaml`.
+
 ### 4 — Run
 
 ```bash
@@ -59,20 +63,23 @@ python tft_roll_tool.py
 ## Usage
 
 1. Launch the tool and select units on the **Build & Roll** tab.
-2. Configure timing in the **Settings** tab if needed (defaults target 1920×1080 fullscreen).
-3. Switch to TFT, then press **START** (or keep TFT focused and let the countdown finish).
-4. Press **ESC** or click **STOP** at any time to halt.
+2. Open the **Settings** tab, pick your display resolution from the dropdown (or enter a custom size), then click **Save Settings**.
+3. Configure timing if needed (defaults are tuned for the selected resolution).
+4. Switch to TFT, then press **START**.
+5. Press **ESC** or click **STOP** at any time to halt.
 
 ---
 
 ## Project structure
 
 ```
-tft_roll_tool.py      # UI — single entry point, all tabs
-tft_backend.py        # v1 backend: input layer, OCR pipeline, RollWorker
-tft_v2_backend.py     # v2 backend: HashMapper, hash-first lookup, RollWorkerV2, AutoCaptureWorker
-hashmap.json          # persisted hash → unit name map (auto-created)
-train/                # training images and result text files (auto-created)
+tft_roll_tool.py         # UI — single entry point, all tabs
+tft_backend.py           # v1 backend: input layer, OCR pipeline, RollWorker
+tft_v2_backend.py        # v2 backend: HashMapper, hash-first lookup, RollWorkerV2, AutoCaptureWorker
+position.yaml            # shop slot positions per resolution (auto-updated on Save)
+hashmap_<W>_<H>.json     # persisted hash → unit name map per resolution (auto-created)
+settings.json            # last-used resolution (auto-created)
+train/                   # training images and result text files (auto-created)
 requirements.txt
 run.sh / run.bat
 ```
@@ -85,7 +92,9 @@ run.sh / run.bat
 
 **New features**
 
-- **Hash-first unit lookup** — on each roll, every name crop is normalised (Otsu binarise → morphological open → tight-trim to text bounding box → resize to 128×20) and MD5-hashed. If the hash is already in `hashmap.json`, the unit name is returned immediately — zero Tesseract calls for known units.
+- **Multi-resolution support** — select your display resolution in the Settings tab. Pre-calculated positions for 1280×720, 1366×768, 1600×900, 1920×1080, 2560×1440, 3840×2160; custom resolutions are proportionally scaled and written to `position.yaml`. Screen positions are no longer exposed as editable spinboxes — they are driven entirely by the resolution choice.
+- **Per-resolution hash maps** — each resolution stores its trained hashes in a dedicated `hashmap_<W>_<H>.json` file. Switching resolutions loads the matching file automatically.
+- **Hash-first unit lookup** — on each roll, every name crop is normalised (Otsu binarise → morphological open → tight-trim to text bounding box → resize to 128×20) and MD5-hashed. If the hash is already in the active `hashmap_<W>_<H>.json`, the unit name is returned immediately — zero Tesseract calls for known units.
 - **Cross-slot invariance** — the normalisation pipeline removes background colour differences, per-slot anti-aliasing noise, and text positional offsets, so the same unit in slot 1 and slot 5 produces an identical hash.
 - **HashMapper** — thread-safe in-memory store backed by `hashmap.json`. Disk writes are async (via `ThreadPoolExecutor`) so they never block the roll loop.
 - **Train Mode tab** — dedicated tab to build and inspect the hash map:
