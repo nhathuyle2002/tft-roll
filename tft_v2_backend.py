@@ -39,7 +39,7 @@ import numpy as np
 
 from tft_backend import (
     TFT_UNITS, DEFAULTS, OCR_AVAILABLE,
-    _ocr_gray, _focus_tft, _press, _click, _d_pressed,
+    _ocr_gray, _focus_tft, _press, _click, _d_pressed, _esc_pressed,
 )
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -155,15 +155,21 @@ class HashMapper:
         with self._lock:
             return self._hash_to_name.get(h)
 
-    def update(self, h: str, name: str, slot: int, score: float = 0.0) -> str | None:
+    def update(self, h: str, name: str, slot: int, score: float = 0.0,
+               allow_overwrite: bool = True) -> tuple[str | None, bool]:
         """
         Register a hash for a specific slot+name.
         Key format: "{slot}_{name}"  e.g. "1_Jinx"
 
-        Conflict rules (existing key, different hash):
-          score >= 0.99 → overwrite stored hash (high-confidence new observation).
-          score <  0.99 → keep stored hash and return a warning string.
-        Returns None when there is nothing to warn about.
+        Write rules:
+          New key AND score >= 0.99              → add new entry.
+          New key AND score <  0.99              → ignore (no write).
+          Existing key, different hash, allow_overwrite=True AND score >= 0.99 → overwrite.
+          otherwise                              → keep stored hash, return warning.
+
+        Returns (message, added) where:
+          message – conflict/overwrite description string, or None
+          added   – True if a new or overwritten entry was flushed to disk
         """
         key      = f"{slot}_{name}"
         changed  = False
@@ -171,18 +177,18 @@ class HashMapper:
         with self._lock:
             existing = self._key_to_hash.get(key)
             if existing is None:
-                # New entry — add and keep map sorted alphabetically
-                self._key_to_hash[key] = h
-                self._key_to_hash = dict(sorted(self._key_to_hash.items()))
-                self._hash_to_name[h] = name
-                changed = True
-            elif existing != h:
                 if score >= 0.99:
+                    # New entry — add and keep map sorted alphabetically
+                    self._key_to_hash[key] = h
+                    self._key_to_hash = dict(sorted(self._key_to_hash.items()))
+                    self._hash_to_name[h] = name
+                    changed = True
+            elif existing != h:
+                if allow_overwrite and score >= 0.99:
                     # High-confidence new observation — overwrite stored hash
                     old_h = existing
                     self._key_to_hash[key] = h
                     self._hash_to_name[h]  = name
-                    # Clean up old reverse-index entry if no other key uses it
                     if old_h not in self._key_to_hash.values():
                         self._hash_to_name.pop(old_h, None)
                     changed  = True
@@ -191,15 +197,15 @@ class HashMapper:
                         f"old={existing[:8]} new={h[:8]} (score={score:.2f} ≥ 0.99)"
                     )
                 else:
-                    # Low-confidence — keep stored hash
+                    # Keep stored hash
                     conflict = (
                         f"[HashMapper] CONFLICT '{key}': "
-                        f"stored={existing[:8]} new={h[:8]} (score={score:.2f} < 0.99) — keeping stored."
+                        f"stored={existing[:8]} new={h[:8]} (score={score:.2f}) — keeping stored."
                     )
             # existing == h → already known, no-op
         if changed:
             _async_pool.submit(self.save)
-        return conflict
+        return conflict, changed
 
     def remove(self, name: str, slot: int):
         """Remove the entry for a specific slot+name."""
@@ -249,13 +255,17 @@ def set_active_resolution(w: int, h: int) -> None:
 # ── Per-slot lookup ───────────────────────────────────────────────────────────
 
 def lookup_or_ocr(gray: np.ndarray, slot: int, threshold: float,
-                  all_names: list, crop_ms: float) -> dict:
+                  all_names: list, crop_ms: float,
+                  train_mode: bool = False) -> dict:
     """
     Hash-first unit lookup with OCR fallback.
 
+    train_mode=True:  never overwrites an existing hash entry (only adds new keys).
+
     Returns the same dict schema as _ocr_gray plus:
-      'source': 'hash' | 'ocr'
-      'hash':   32-char MD5 hex of the normalized crop
+      'source':        'hash' | 'ocr'
+      'hash':          32-char MD5 hex of the normalized crop
+      'hash_new_entry': True when a brand-new hash key was written to the map
     """
     normalized = normalize_crop(gray)
     h          = compute_hash(normalized)
@@ -268,6 +278,7 @@ def lookup_or_ocr(gray: np.ndarray, slot: int, threshold: float,
             "crop_ms": round(crop_ms, 1), "ocr_ms": 0.0,
             "source": "hash", "hash": h,
             "normalized": normalized,
+            "hash_new_entry": False,
         }
 
     # Cache miss → fall back to OCR
@@ -276,8 +287,13 @@ def lookup_or_ocr(gray: np.ndarray, slot: int, threshold: float,
     result["hash"]           = h
     result["hash_conflict"]  = None
     result["normalized"]     = normalized
+    result["hash_new_entry"] = False
     if result["match"]:
-        conflict = _hashmap.update(h, result["match"], slot, result["score"])
+        conflict, added = _hashmap.update(
+            h, result["match"], slot, result["score"],
+            allow_overwrite=not train_mode,
+        )
+        result["hash_new_entry"] = added
         if conflict:
             print(conflict)
             result["hash_conflict"] = conflict
@@ -374,16 +390,20 @@ def capture_once(name_regions: list, threshold: float) -> tuple[int, list[dict]]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         results.append(
             lookup_or_ocr(gray, i + 1, threshold, all_names,
-                          (time.perf_counter() - t0) * 1000)
+                          (time.perf_counter() - t0) * 1000,
+                          train_mode=True)
         )
 
-    full_bgr = cv2.cvtColor(full_rgb, cv2.COLOR_RGB2BGR)
-    lines = [
-        f"S{r['slot']} → {r['match'] or '?'}  source={r.get('source', '?')}"
-        for r in results
-    ]
-    idx = save_train_sample(full_bgr, lines, results)
-    return idx, results
+    # Only save to train folder if at least one slot produced a new hash entry
+    if any(r.get("hash_new_entry") for r in results):
+        full_bgr = cv2.cvtColor(full_rgb, cv2.COLOR_RGB2BGR)
+        lines = [
+            f"S{r['slot']} → {r['match'] or '?'}  source={r.get('source', '?')}"
+            for r in results
+        ]
+        save_train_sample(full_bgr, lines, results)
+        return _next_train_idx() - 1, results
+    return -1, results
 
 
 def run_train_on_image(img_path: str, name_regions: list,
@@ -412,17 +432,20 @@ def run_train_on_image(img_path: str, name_regions: list,
         crop   = img_cv[y0:y1, x:x + w]
         gray   = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         result = lookup_or_ocr(gray, i + 1, threshold, all_names,
-                               (time.perf_counter() - t0) * 1000)
+                               (time.perf_counter() - t0) * 1000,
+                               train_mode=True)
         result["img_size"]      = (img_w, img_h)
         result["scaled_region"] = [x, y, w, h]
         results.append(result)
 
-    lines = [
-        f"S{r['slot']} → {r['match'] or '?'}  source={r.get('source', '?')}"
-        f"  hash={r.get('hash', '')[:8]}"
-        for r in results
-    ]
-    save_train_sample(img_cv, lines, results)
+    # Only save to train folder if at least one slot produced a new hash entry
+    if any(r.get("hash_new_entry") for r in results):
+        lines = [
+            f"S{r['slot']} → {r['match'] or '?'}  source={r.get('source', '?')}"
+            f"  hash={r.get('hash', '')[:8]}"
+            for r in results
+        ]
+        save_train_sample(img_cv, lines, results)
     return results
 
 
