@@ -92,7 +92,7 @@ run.sh / run.bat
   - Upload any screenshot → Run Hash+OCR → results logged with `⚡` (hash hit) or `🔬` (OCR fallback).
   - **Manual capture** — captures the live screen once in a background thread.
   - **Auto capture** — captures every N seconds (configurable, default 15 s) while you play.
-  - All captured images saved to `train/<n>_image.png` with corresponding `train/<n>_result.txt`.
+  - All captured images saved to `train/<n>_image.png` with corresponding `train/<n>_result.txt` and per-slot preprocessed crops `train/<n>_norm_<slot>.png` (the exact binary image used for hashing).
 - **Roll status** now shows hash hit count per roll: `[42ms ⚡4/5]`.
 - **`RollWorkerV2`** — drop-in replacement for `RollWorker` using `ocr_all_slots_v2` (hash-first).
 

@@ -50,13 +50,16 @@ def _find_tft_hwnd() -> int:
     return 0
 
 
-def _focus_tft() -> None:
+def _focus_tft() -> bool:
+    """Focus the TFT window. Returns True if found, False if not running."""
     if not _IS_WINDOWS or _user32 is None:
-        return
+        return True   # macOS/test — treat as success
     hwnd = _find_tft_hwnd()
     if hwnd:
         _user32.SetForegroundWindow(hwnd)
         time.sleep(0.05)
+        return True
+    return False
 
 
 def _esc_pressed() -> bool:
@@ -408,7 +411,9 @@ class RollWorker(QThread):
             # ── Trigger ───────────────────────────────────────────
             if auto_roll:
                 # Auto: previous buy cycle is done → press D immediately
-                _focus_tft()
+                if not _focus_tft():
+                    self.stop("⚠ TFT window not found. Is the game running?")
+                    break
                 _press("d")
                 count += 1
                 self.roll_signal.emit(count)
@@ -428,7 +433,9 @@ class RollWorker(QThread):
                     break
                 count += 1
                 self.roll_signal.emit(count)
-                _focus_tft()
+                if not _focus_tft():
+                    self.stop("⚠ TFT window not found. Is the game running?")
+                    break
 
             if not self._running:
                 break

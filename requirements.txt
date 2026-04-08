@@ -1,19 +1,11 @@
 # TFT Roll Tool - Python dependencies
 # Install with:  pip install -r requirements.txt
 #
-# NOTES:
-#   import cv2        -> pip install opencv-python
-#   import pydirectinput -> pip install pydirectinput
-#     (uses DirectInput scan codes — works in-game, Vanguard-safe)
-#
-# OCR requires the Tesseract binary installed separately:
-#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
-#   macOS:   brew install tesseract
-#   Ubuntu:  sudo apt install tesseract-ocr
+# NOTE: Tesseract binary must be installed separately (Windows):
+#   https://github.com/UB-Mannheim/tesseract/wiki
 
 PyQt5>=5.15
-pyautogui>=0.9.54
-pydirectinput>=1.0.4  # Windows only — skip on macOS (UI-only testing works without it)
+pydirectinput>=1.0.4
 pytesseract>=0.3.10
 opencv-python>=4.8
 numpy>=1.24

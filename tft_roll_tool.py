@@ -1080,8 +1080,22 @@ class TFTRollTool(QMainWindow):
         btn_reload = QPushButton("⟳ Refresh")
         btn_reload.setFixedWidth(90)
         btn_reload.clicked.connect(self._train_refresh_hm)
+        # Train-mode OCR threshold (kept separate from roll threshold)
         hm_row.addWidget(self._hm_lbl)
         hm_row.addStretch()
+        hm_row.addWidget(QLabel("Train threshold (score ≥0.90 accepted):"))
+        self._train_thr_sp = QDoubleSpinBox()
+        self._train_thr_sp.setRange(0.50, 1.00)
+        self._train_thr_sp.setSingleStep(0.01)
+        self._train_thr_sp.setValue(0.90)
+        self._train_thr_sp.setFixedWidth(72)
+        self._train_thr_sp.setToolTip(
+            "Score range: 0.0 (no match) – 1.0 (identical).\n"
+            "Recommended ≥0.90 for training so only high-confidence\n"
+            "OCR results are saved to the hash map."
+        )
+        hm_row.addWidget(self._train_thr_sp)
+        hm_row.addSpacing(8)
         hm_row.addWidget(btn_reload)
         lay.addLayout(hm_row)
 
@@ -1187,7 +1201,7 @@ class TFTRollTool(QMainWindow):
         results = run_train_on_image(
             self._train_img_path,
             [list(r) for r in DEFAULTS["name_regions"]],
-            self._ocr_thr_sp.value(),
+            self._train_thr_sp.value(),
         )
         self._train_append(results, f"File: {self._train_img_path.split('/')[-1]}")
         self._train_refresh_hm()
@@ -1200,7 +1214,7 @@ class TFTRollTool(QMainWindow):
         self._cap_status.setText("Capturing…")
         self._cap_thread = _CaptureThread(
             [list(r) for r in DEFAULTS["name_regions"]],
-            self._ocr_thr_sp.value(),
+            self._train_thr_sp.value(),
         )
         self._cap_thread.done.connect(self._on_manual_done)
         self._cap_thread.error.connect(
@@ -1224,7 +1238,7 @@ class TFTRollTool(QMainWindow):
             cfg = {
                 "capture_interval": self._cap_interval_sp.value(),
                 "name_regions":     [list(r) for r in DEFAULTS["name_regions"]],
-                "ocr_threshold":    self._ocr_thr_sp.value(),
+                "ocr_threshold":    self._train_thr_sp.value(),
             }
             self._auto_capture = AutoCaptureWorker(cfg)
             self._auto_capture.status_signal.connect(self._cap_status.setText)
@@ -1247,17 +1261,35 @@ class TFTRollTool(QMainWindow):
                 f"<span style='color:#ffd700;font-weight:bold;'>{header}</span>"
             )
         for r in results:
-            src   = r.get("source", "?")
-            match = r["match"] or "—"
-            icon  = "⚡" if src == "hash" else "🔬"
-            clr   = "#56d364" if r["match"] else "#f85149"
-            t     = f"crop&nbsp;{r['crop_ms']:.0f}+ocr&nbsp;{r['ocr_ms']:.0f}ms"
-            h8    = r.get("hash", "")[:8]
+            src      = r.get("source", "?")
+            match    = r["match"] or "—"
+            score    = r.get("score", 0.0)
+            icon     = "⚡" if src == "hash" else "🔬"
+            accepted = r["match"] is not None
+            clr      = "#56d364" if accepted else "#f85149"
+            t        = f"crop&nbsp;{r['crop_ms']:.0f}+ocr&nbsp;{r['ocr_ms']:.0f}ms"
+            h8       = r.get("hash", "")[:8]
+            conflict = r.get("hash_conflict")
+            # Score colour: green ≥0.90, orange ≥0.70, red <0.70
+            if score >= 0.90:
+                score_clr = "#56d364"
+            elif score >= 0.70:
+                score_clr = "#ffa500"
+            else:
+                score_clr = "#f85149"
+            score_tag = (
+                f"<span style='color:{score_clr};font-weight:bold;'>{score:.2f}</span>"
+            )
             self._train_log.append(
                 f"<span style='color:{clr};'>{icon} S{r['slot']} → {match}</span>"
+                f" score={score_tag}"
                 f" <span style='color:#8b949e;font-size:10px;'>"
                 f"[{t}] raw={r['raw']!r} h={h8}</span>"
             )
+            if conflict:
+                self._train_log.append(
+                    f"<span style='color:#ffa500;font-size:10px;'>⚠ {conflict}</span>"
+                )
         self._train_log.append("")
 
     # ─────────────────────────────────────────────────────────

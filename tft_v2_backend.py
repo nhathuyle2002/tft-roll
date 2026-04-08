@@ -97,33 +97,47 @@ def compute_hash(normalized: np.ndarray) -> str:
 
 class HashMapper:
     """
-    Thread-safe in-memory store backed by hashmap.json.
-    Maps  hash_str → unit_name.
-    All disk writes are async (daemon threads) so they never block the roll loop.
+    Thread-safe store backed by hashmap.json.
+
+    Storage format (JSON):  { "<slot>_<unit_name>": hash_value }  — sorted A→Z by key.
+    In-memory reverse index: { hash_value: unit_name }  — for O(1) roll-time lookup.
+
+    update() rules:
+      • key not in map            → add, re-sort alphabetically, async save.
+      • key in map, same hash     → no-op.
+      • key in map, DIFF hash     → conflict: log warning, keep stored hash.
+        This catches normalisation drift between game patches or monitor settings.
     """
 
     def __init__(self):
-        self._map:  dict[str, str] = {}
+        self._key_to_hash:  dict[str, str] = {}   # "{slot}_{name}" → hash, persisted
+        self._hash_to_name: dict[str, str] = {}   # hash → name, in-memory only
         self._lock = Lock()
         self.load()
 
     def load(self) -> int:
-        """Reload from disk. Returns number of entries loaded."""
+        """Reload from disk, rebuild reverse index. Returns number of entries."""
         if HASHMAP_PATH.exists():
             try:
                 with open(HASHMAP_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                    data: dict[str, str] = json.load(f)
+                reverse: dict[str, str] = {}
+                for key, h in data.items():
+                    # key format: "1_Jinx" → name is everything after first "_"
+                    name = key.split("_", 1)[1] if "_" in key else key
+                    reverse[h] = name
                 with self._lock:
-                    self._map = data
+                    self._key_to_hash  = dict(data)
+                    self._hash_to_name = reverse
                 return len(data)
             except Exception:
                 pass
         return 0
 
     def save(self):
-        """Write to disk. Safe to call from any thread."""
+        """Write key→hash map to disk (sorted). Safe to call from any thread."""
         with self._lock:
-            snapshot = dict(self._map)
+            snapshot = dict(self._key_to_hash)
         try:
             with open(HASHMAP_PATH, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, ensure_ascii=False)
@@ -131,30 +145,59 @@ class HashMapper:
             pass
 
     def lookup(self, h: str) -> str | None:
+        """O(1) hash → name lookup used during rolling."""
         with self._lock:
-            return self._map.get(h)
+            return self._hash_to_name.get(h)
 
-    def update(self, h: str, name: str):
-        """Add entry if not already known; async disk write."""
+    def update(self, h: str, name: str, slot: int) -> str | None:
+        """
+        Register a hash for a specific slot+name.
+        Key format: "{slot}_{name}"  e.g. "1_Jinx"
+        Returns a conflict warning string if the key already has a different hash,
+        otherwise returns None.
+        """
+        key      = f"{slot}_{name}"
+        changed  = False
+        conflict = None
         with self._lock:
-            if h in self._map:
-                return
-            self._map[h] = name
-        _async_pool.submit(self.save)
+            existing = self._key_to_hash.get(key)
+            if existing is None:
+                # New entry — add and keep map sorted alphabetically
+                self._key_to_hash[key] = h
+                self._key_to_hash = dict(sorted(self._key_to_hash.items()))
+                self._hash_to_name[h] = name
+                changed = True
+            elif existing != h:
+                # Same slot+name, different hash → conflict
+                conflict = (
+                    f"[HashMapper] CONFLICT '{key}': "
+                    f"stored={existing[:8]} new={h[:8]} — keeping stored hash."
+                )
+            # existing == h → already known, no-op
+        if changed:
+            _async_pool.submit(self.save)
+        return conflict
 
-    def remove(self, h: str):
+    def remove(self, name: str, slot: int):
+        """Remove the entry for a specific slot+name."""
+        key = f"{slot}_{name}"
         with self._lock:
-            self._map.pop(h, None)
+            h = self._key_to_hash.pop(key, None)
+            if h is not None:
+                # Only remove reverse index if no other slot has the same hash
+                if h not in self._key_to_hash.values():
+                    self._hash_to_name.pop(h, None)
         _async_pool.submit(self.save)
 
     @property
     def size(self) -> int:
         with self._lock:
-            return len(self._map)
+            return len(self._key_to_hash)
 
     def all_entries(self) -> list[tuple[str, str]]:
+        """Returns list of (key, hash) sorted alphabetically. key = '{slot}_{name}'."""
         with self._lock:
-            return list(self._map.items())
+            return list(self._key_to_hash.items())
 
 
 # Global singleton loaded once at import
@@ -186,14 +229,20 @@ def lookup_or_ocr(gray: np.ndarray, slot: int, threshold: float,
             "score": 1.0, "best_candidate": hit,
             "crop_ms": round(crop_ms, 1), "ocr_ms": 0.0,
             "source": "hash", "hash": h,
+            "normalized": normalized,
         }
 
     # Cache miss → fall back to OCR
     result = _ocr_gray(gray, slot, threshold, all_names, crop_ms)
-    result["source"] = "ocr"
-    result["hash"]   = h
+    result["source"]         = "ocr"
+    result["hash"]           = h
+    result["hash_conflict"]  = None
+    result["normalized"]     = normalized
     if result["match"]:
-        _async_pool.submit(_hashmap.update, h, result["match"])
+        conflict = _hashmap.update(h, result["match"], slot)
+        if conflict:
+            print(conflict)
+            result["hash_conflict"] = conflict
     return result
 
 
@@ -241,14 +290,22 @@ def _next_train_idx() -> int:
     return max(nums, default=0) + 1
 
 
-def save_train_sample(img_bgr: np.ndarray, result_lines: list[str]) -> int:
-    """Save a training image (BGR numpy array) + result text. Returns sample index."""
+def save_train_sample(img_bgr: np.ndarray, result_lines: list[str],
+                      results: list[dict] | None = None) -> int:
+    """Save a training image (BGR numpy array) + result text + per-slot normalized
+    crops. Returns sample index."""
     TRAIN_DIR.mkdir(exist_ok=True)
     idx = _next_train_idx()
     cv2.imwrite(str(TRAIN_DIR / f"{idx}_image.png"), img_bgr)
     (TRAIN_DIR / f"{idx}_result.txt").write_text(
         "\n".join(result_lines), encoding="utf-8"
     )
+    if results:
+        for r in results:
+            norm = r.get("normalized")
+            if norm is not None and norm.size > 0:
+                slot = r.get("slot", 0)
+                cv2.imwrite(str(TRAIN_DIR / f"{idx}_norm_{slot}.png"), norm)
     return idx
 
 
@@ -287,7 +344,7 @@ def capture_once(name_regions: list, threshold: float) -> tuple[int, list[dict]]
         f"S{r['slot']} → {r['match'] or '?'}  source={r.get('source', '?')}"
         for r in results
     ]
-    idx = save_train_sample(full_bgr, lines)
+    idx = save_train_sample(full_bgr, lines, results)
     return idx, results
 
 
@@ -327,7 +384,7 @@ def run_train_on_image(img_path: str, name_regions: list,
         f"  hash={r.get('hash', '')[:8]}"
         for r in results
     ]
-    save_train_sample(img_cv, lines)
+    save_train_sample(img_cv, lines, results)
     return results
 
 
@@ -420,7 +477,9 @@ class RollWorkerV2(QThread):
                 break
             # ── Trigger ──────────────────────────────────────────
             if auto_roll:
-                _focus_tft()
+                if not _focus_tft():
+                    self.stop("⚠ TFT window not found. Is the game running?")
+                    break
                 _press("d")
                 count += 1
                 self.roll_signal.emit(count)
@@ -438,7 +497,9 @@ class RollWorkerV2(QThread):
                     break
                 count += 1
                 self.roll_signal.emit(count)
-                _focus_tft()
+                if not _focus_tft():
+                    self.stop("⚠ TFT window not found. Is the game running?")
+                    break
 
             if not self._running:
                 break
