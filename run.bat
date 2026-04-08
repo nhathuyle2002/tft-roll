@@ -58,10 +58,7 @@ echo.
 
 :: ── Launch ───────────────────────────────────────────────────
 echo Launching TFT Roll Tool...
-echo   (Close this window to stop the tool)
+echo   (Close the app window to stop the tool)
 echo.
 python tft_roll_tool.py
-
-echo.
-echo TFT Roll Tool exited.
-pause
+exit

@@ -505,9 +505,18 @@ class TFTRollTool(QMainWindow):
         rl3.addWidget(esc_hint)
 
         # Overlay toggle + auto-show option
-        overlay_row = QHBoxLayout(); overlay_row.setSpacing(8)
+        self._auto_overlay_cb = QCheckBox("Auto-show overlay on start")
+        self._auto_overlay_cb.setChecked(True)
+        self._auto_overlay_cb.setStyleSheet("color:#8b949e;font-size:10px;")
+        self._auto_overlay_cb.setToolTip(
+            "When checked, the log overlay is shown automatically\n"
+            "whenever rolling or auto-capture starts."
+        )
+        rl3.addWidget(self._auto_overlay_cb)
+
         self._overlay_btn = QPushButton("📌  Show Log Overlay")
-        self._overlay_btn.setFixedHeight(30)
+        self._overlay_btn.setFixedHeight(38)
+        self._overlay_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._overlay_btn.setCheckable(True)
         self._overlay_btn.setStyleSheet(
             "QPushButton{background:#1a1a2e;color:#bc8cff;border:1px solid #bc8cff;"
@@ -516,34 +525,16 @@ class TFTRollTool(QMainWindow):
             "QPushButton:hover{background:#2a2a4e;}"
         )
         self._overlay_btn.clicked.connect(self._toggle_overlay)
-
-        self._auto_overlay_cb = QCheckBox("Auto-show on start")
-        self._auto_overlay_cb.setChecked(True)
-        self._auto_overlay_cb.setStyleSheet("color:#8b949e;font-size:10px;")
-        self._auto_overlay_cb.setToolTip(
-            "When checked, the log overlay is shown automatically\n"
-            "whenever rolling or auto-capture starts."
-        )
-        overlay_row.addWidget(self._overlay_btn)
-        overlay_row.addWidget(self._auto_overlay_cb)
-        overlay_row.addStretch()
-        rl3.addLayout(overlay_row)
+        rl3.addWidget(self._overlay_btn)
 
         tip = QLabel("Move mouse to top-left corner to emergency stop.")
         tip.setStyleSheet("color:#555;font-size:10px;")
         rl3.addWidget(tip)
         rc.addWidget(rg, 1)
 
-        # OCR log
-        lg = QGroupBox("Shop OCR Log"); ll = QVBoxLayout(lg)
+        # _log kept as a hidden sink so existing append calls remain valid
         self._log = QTextEdit(); self._log.setReadOnly(True)
-        self._log.setMaximumHeight(100)
-        self._log.setStyleSheet(
-            "QTextEdit{background:#0d1117;color:#8b949e;font-size:10px;"
-            "border:none;font-family:Consolas,monospace;}"
-        )
-        ll.addWidget(self._log)
-        rc.addWidget(lg, 1)
+        self._log.hide()
 
         rw2 = QWidget(); rw2.setLayout(rc)
         row.addWidget(rw2, 2)
@@ -1215,12 +1206,26 @@ class TFTRollTool(QMainWindow):
         cglay   = QVBoxLayout(cap_grp)
         row2 = QHBoxLayout()
         self._btn_manual_cap = QPushButton("📸  Manual Capture (now)")
+        self._btn_manual_cap.setFixedSize(200, 26)
+        self._btn_manual_cap.setStyleSheet(
+            "QPushButton{background:#1a2a1a;color:#56d364;border:1px solid #56d364;"
+            "border-radius:5px;font-size:11px;}"
+            "QPushButton:hover{background:#235c23;}"
+            "QPushButton:disabled{background:#1e1e1e;color:#555;border-color:#333;}"
+        )
         self._btn_manual_cap.clicked.connect(self._train_manual_capture)
         row2.addWidget(self._btn_manual_cap)
         row2.addStretch()
         cglay.addLayout(row2)
         row3 = QHBoxLayout()
         self._btn_auto_cap = QPushButton("▶  Start Auto Capture")
+        self._btn_auto_cap.setFixedSize(200, 26)
+        self._btn_auto_cap.setStyleSheet(
+            "QPushButton{background:#1a1a3a;color:#58a6ff;border:1px solid #58a6ff;"
+            "border-radius:5px;font-size:11px;}"
+            "QPushButton:checked{background:#0d3a5c;color:#ffd700;border-color:#ffd700;}"
+            "QPushButton:hover{background:#253850;}"
+        )
         self._btn_auto_cap.setCheckable(True)
         self._btn_auto_cap.clicked.connect(self._train_toggle_auto)
         self._cap_interval_sp = QSpinBox()
