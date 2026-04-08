@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
     QTextEdit, QSizePolicy, QFileDialog, QButtonGroup, QRadioButton,
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QBrush, QColor
 
 from tft_backend import (
@@ -22,10 +22,12 @@ from tft_backend import (
     TFT_UNITS, COST_COLOR, COST_BG, COST_LABEL,
     DEFAULTS,
     ocr_all_slots, ocr_from_image_file,
-    RollWorker, EscWatcher,
 )
-# pyqtSignal is re-exported for the overlay / chip widgets defined here
-from PyQt5.QtCore import pyqtSignal
+from tft_v2_backend import (
+    RollWorkerV2, AutoCaptureWorker,
+    capture_once, run_train_on_image,
+    get_hashmap, HASHMAP_PATH, TRAIN_DIR,
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -268,6 +270,24 @@ class _ScaledImageLabel(QLabel):
         super().setPixmap(scaled)
 
 
+# ── One-shot manual capture thread ───────────────────────────
+class _CaptureThread(QThread):
+    done  = pyqtSignal(int, list)
+    error = pyqtSignal(str)
+
+    def __init__(self, regions: list, threshold: float):
+        super().__init__()
+        self._regions   = regions
+        self._threshold = threshold
+
+    def run(self):
+        try:
+            idx, results = capture_once(self._regions, self._threshold)
+            self.done.emit(idx, results)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ─────────────────────────────────────────────────────────────
 class TFTRollTool(QMainWindow):
     def __init__(self):
@@ -276,10 +296,12 @@ class TFTRollTool(QMainWindow):
         self.setMinimumSize(920, 680)
         self.resize(1000, 740)
 
-        self._selected:     dict[str, int] = {}
-        self._buttons:      dict[str, UnitButton] = {}
-        self._worker:       RollWorker | None = None
-        self._esc_watcher:  EscWatcher | None = None
+        self._selected:       dict[str, int] = {}
+        self._buttons:        dict[str, UnitButton] = {}
+        self._worker:         RollWorkerV2 | None = None
+        self._auto_capture:   AutoCaptureWorker | None = None
+        self._train_img_path: str | None = None
+        self._cap_thread:     _CaptureThread | None = None
 
         # Floating log overlay (always-on-top)
         self._overlay = LogOverlay()
@@ -301,17 +323,18 @@ class TFTRollTool(QMainWindow):
         hdr.setStyleSheet("color:#ffd700;padding:2px 0;")
         rl.addWidget(hdr)
 
-        tabs = QTabWidget()
-        tabs.setStyleSheet(
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(
             "QTabWidget::pane{border:1px solid #333;}"
             "QTabBar::tab{background:#1e1e1e;color:#aaa;padding:6px 18px;}"
             "QTabBar::tab:selected{background:#2a2a2a;color:white;"
             "border-bottom:2px solid #ffd700;}"
         )
-        rl.addWidget(tabs)
-        tabs.addTab(self._tab_main(),     "🎮  Build & Roll")
-        tabs.addTab(self._tab_settings(), "⚙  Settings")
-        tabs.addTab(self._tab_ocr_test(),  "🔬  OCR Test")
+        rl.addWidget(self._tabs)
+        self._tabs.addTab(self._tab_main(),     "🎮  Build & Roll")
+        self._tabs.addTab(self._tab_settings(), "⚙  Settings")
+        self._tabs.addTab(self._tab_ocr_test(),  "🔬  OCR Test")
+        self._tabs.addTab(self._tab_train(),     "🧠  Train Mode")
 
     # ─────────────────────────────────────────────────────────
     #  Build & Roll tab  (no timing knobs here)
@@ -964,17 +987,13 @@ class TFTRollTool(QMainWindow):
             "click_pos":     [list(p) for p in DEFAULTS["click_pos"]],
             "name_regions":  [list(r) for r in DEFAULTS["name_regions"]],
         }
-        self._worker = RollWorker(cfg)
+        self._worker = RollWorkerV2(cfg)
         self._worker.status_signal.connect(self._on_status)
         self._worker.roll_signal.connect(self._on_roll)
         self._worker.found_signal.connect(self._on_found)
         self._worker.shop_signal.connect(self._on_shop)
         self._worker.finished.connect(self._on_done)
         self._worker.start()
-
-        self._esc_watcher = EscWatcher()
-        self._esc_watcher.triggered.connect(self._on_esc)
-        self._esc_watcher.start()
 
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -1022,12 +1041,13 @@ class TFTRollTool(QMainWindow):
         self._overlay.append_shop_row(results)
         parts = []
         for s in results:
-            raw   = s.get("raw") or ""
-            match = s["match"]
-            cand  = s.get("best_candidate") or ""
-            t     = f"<span style='color:#444;font-size:9px;'>[{s['crop_ms']}+{s['ocr_ms']}ms]</span>"
+            raw     = s.get("raw") or ""
+            match   = s["match"]
+            cand    = s.get("best_candidate") or ""
+            src_tag = "⚡" if s.get("source") == "hash" else ""
+            t       = f"<span style='color:#444;font-size:9px;'>[{s['crop_ms']}+{s['ocr_ms']}ms]</span>"
             if match:
-                parts.append(f"<span style='color:#56d364;'>S{s['slot']} → <b>{match}</b> ✓</span>{t}")
+                parts.append(f"<span style='color:#56d364;'>S{s['slot']} → <b>{match}</b> ✓{src_tag}</span>{t}")
             elif raw:
                 label = cand if cand else raw
                 parts.append(f"<span style='color:#555;'>S{s['slot']} → {label} ✗</span>{t}")
@@ -1042,6 +1062,203 @@ class TFTRollTool(QMainWindow):
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._worker = None
+
+    # ─────────────────────────────────────────────────────────
+    #  Train Mode tab
+    # ─────────────────────────────────────────────────────────
+
+    def _tab_train(self) -> QWidget:
+        w   = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        # Hashmap stats bar
+        hm_row = QHBoxLayout()
+        self._hm_lbl = QLabel("Hashmap: loading…")
+        self._hm_lbl.setStyleSheet("color:#ffd700;font-weight:bold;")
+        btn_reload = QPushButton("⟳ Refresh")
+        btn_reload.setFixedWidth(90)
+        btn_reload.clicked.connect(self._train_refresh_hm)
+        hm_row.addWidget(self._hm_lbl)
+        hm_row.addStretch()
+        hm_row.addWidget(btn_reload)
+        lay.addLayout(hm_row)
+
+        # ── Train from file ───────────────────────────────────
+        img_grp = QGroupBox("Train from Screenshot File")
+        iglay   = QVBoxLayout(img_grp)
+        row1 = QHBoxLayout()
+        btn_browse = QPushButton("📂  Browse…")
+        btn_browse.setFixedWidth(100)
+        btn_browse.clicked.connect(self._train_browse)
+        self._train_file_lbl = QLabel("No file selected")
+        self._train_file_lbl.setStyleSheet("color:#8b949e;")
+        self._btn_run_img = QPushButton("▶  Run Hash+OCR")
+        self._btn_run_img.setEnabled(False)
+        self._btn_run_img.clicked.connect(self._train_run_file)
+        row1.addWidget(btn_browse)
+        row1.addWidget(self._train_file_lbl, 1)
+        row1.addWidget(self._btn_run_img)
+        iglay.addLayout(row1)
+        self._train_thumb = QLabel()
+        self._train_thumb.setFixedHeight(80)
+        self._train_thumb.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._train_thumb.hide()
+        iglay.addWidget(self._train_thumb)
+        lay.addWidget(img_grp)
+
+        # ── In-game capture ───────────────────────────────────
+        cap_grp = QGroupBox("In-Game Capture")
+        cglay   = QVBoxLayout(cap_grp)
+        row2 = QHBoxLayout()
+        self._btn_manual_cap = QPushButton("📸  Manual Capture (now)")
+        self._btn_manual_cap.clicked.connect(self._train_manual_capture)
+        row2.addWidget(self._btn_manual_cap)
+        row2.addStretch()
+        cglay.addLayout(row2)
+        row3 = QHBoxLayout()
+        self._btn_auto_cap = QPushButton("▶  Start Auto Capture")
+        self._btn_auto_cap.setCheckable(True)
+        self._btn_auto_cap.clicked.connect(self._train_toggle_auto)
+        self._cap_interval_sp = QSpinBox()
+        self._cap_interval_sp.setRange(5, 300)
+        self._cap_interval_sp.setValue(15)
+        self._cap_interval_sp.setFixedWidth(70)
+        row3.addWidget(self._btn_auto_cap)
+        row3.addWidget(QLabel("  Interval (s):"))
+        row3.addWidget(self._cap_interval_sp)
+        row3.addStretch()
+        cglay.addLayout(row3)
+        self._cap_status = QLabel("Idle")
+        self._cap_status.setStyleSheet("color:#8b949e;font-size:11px;")
+        cglay.addWidget(self._cap_status)
+        lay.addWidget(cap_grp)
+
+        # ── Results log ───────────────────────────────────────
+        res_grp = QGroupBox("Results  (⚡ = hash hit, 🔬 = OCR fallback)")
+        rglay   = QVBoxLayout(res_grp)
+        self._train_log = QTextEdit()
+        self._train_log.setReadOnly(True)
+        self._train_log.setFont(QFont("Consolas,monospace", 10))
+        self._train_log.setStyleSheet(
+            "background:#0d1117;color:#c9d1d9;border:none;"
+        )
+        rglay.addWidget(self._train_log)
+        lay.addWidget(res_grp, 1)
+
+        self._train_refresh_hm()
+        return w
+
+    def _train_refresh_hm(self):
+        hm = get_hashmap()
+        hm.load()
+        n = hm.size
+        self._hm_lbl.setText(
+            f"Hashmap: {n} entr{'y' if n == 1 else 'ies'}  ·  {HASHMAP_PATH.name}"
+        )
+
+    def _train_browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Screenshot", "",
+            "Images (*.png *.jpg *.jpeg *.bmp)"
+        )
+        if not path:
+            return
+        self._train_img_path = path
+        self._train_file_lbl.setText(path.split("/")[-1])
+        self._btn_run_img.setEnabled(True)
+        pix = QPixmap(path)
+        if not pix.isNull():
+            self._train_thumb.setPixmap(
+                pix.scaledToHeight(76, Qt.SmoothTransformation)
+            )
+            self._train_thumb.show()
+
+    def _train_run_file(self):
+        if not self._train_img_path:
+            return
+        if not OCR_AVAILABLE:
+            self._train_log.append(
+                "<span style='color:#f85149;'>OCR not available.</span>"
+            )
+            return
+        self._train_log.clear()
+        results = run_train_on_image(
+            self._train_img_path,
+            [list(r) for r in DEFAULTS["name_regions"]],
+            self._ocr_thr_sp.value(),
+        )
+        self._train_append(results, f"File: {self._train_img_path.split('/')[-1]}")
+        self._train_refresh_hm()
+
+    def _train_manual_capture(self):
+        if not OCR_AVAILABLE:
+            self._cap_status.setText("OCR not available.")
+            return
+        self._btn_manual_cap.setEnabled(False)
+        self._cap_status.setText("Capturing…")
+        self._cap_thread = _CaptureThread(
+            [list(r) for r in DEFAULTS["name_regions"]],
+            self._ocr_thr_sp.value(),
+        )
+        self._cap_thread.done.connect(self._on_manual_done)
+        self._cap_thread.error.connect(
+            lambda e: self._cap_status.setText(f"Error: {e}")
+        )
+        self._cap_thread.finished.connect(
+            lambda: self._btn_manual_cap.setEnabled(True)
+        )
+        self._cap_thread.start()
+
+    def _on_manual_done(self, idx: int, results: list):
+        self._cap_status.setText(
+            f"#{idx} saved  |  hashmap: {get_hashmap().size} entries"
+        )
+        self._train_append(results, f"Manual capture #{idx}")
+        self._train_refresh_hm()
+
+    def _train_toggle_auto(self, checked: bool):
+        if checked:
+            self._btn_auto_cap.setText("■  Stop Auto Capture")
+            cfg = {
+                "capture_interval": self._cap_interval_sp.value(),
+                "name_regions":     [list(r) for r in DEFAULTS["name_regions"]],
+                "ocr_threshold":    self._ocr_thr_sp.value(),
+            }
+            self._auto_capture = AutoCaptureWorker(cfg)
+            self._auto_capture.status_signal.connect(self._cap_status.setText)
+            self._auto_capture.capture_done.connect(self._on_auto_done)
+            self._auto_capture.start()
+        else:
+            self._btn_auto_cap.setText("▶  Start Auto Capture")
+            if self._auto_capture:
+                self._auto_capture.stop()
+                self._auto_capture = None
+            self._cap_status.setText("Idle")
+
+    def _on_auto_done(self, idx: int, results: list):
+        self._train_append(results, f"Auto capture #{idx}")
+        self._train_refresh_hm()
+
+    def _train_append(self, results: list, header: str = ""):
+        if header:
+            self._train_log.append(
+                f"<span style='color:#ffd700;font-weight:bold;'>{header}</span>"
+            )
+        for r in results:
+            src   = r.get("source", "?")
+            match = r["match"] or "—"
+            icon  = "⚡" if src == "hash" else "🔬"
+            clr   = "#56d364" if r["match"] else "#f85149"
+            t     = f"crop&nbsp;{r['crop_ms']:.0f}+ocr&nbsp;{r['ocr_ms']:.0f}ms"
+            h8    = r.get("hash", "")[:8]
+            self._train_log.append(
+                f"<span style='color:{clr};'>{icon} S{r['slot']} → {match}</span>"
+                f" <span style='color:#8b949e;font-size:10px;'>"
+                f"[{t}] raw={r['raw']!r} h={h8}</span>"
+            )
+        self._train_log.append("")
 
     # ─────────────────────────────────────────────────────────
     #  Theme
@@ -1065,8 +1282,10 @@ class TFTRollTool(QMainWindow):
         """)
 
     def closeEvent(self, event):
-        if self._esc_watcher:
-            self._esc_watcher.stop(); self._esc_watcher.wait(500)
+        if self._auto_capture:
+            self._auto_capture.stop(); self._auto_capture.wait(1000)
+        if self._cap_thread and self._cap_thread.isRunning():
+            self._cap_thread.wait(2000)
         if self._worker:
             self._worker.stop(); self._worker.wait(2000)
         self._overlay.close()

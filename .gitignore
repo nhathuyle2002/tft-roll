@@ -4,8 +4,8 @@ __pycache__/
 *.pyo
 *.pyd
 
-# OCR debug output
-ocr_debug/
+# Train
+train/
 
 # Virtual environments
 .venv/

@@ -373,8 +373,21 @@ class RollWorker(QThread):
         return not self._stop_event.is_set()
 
     def _sleep(self, seconds: float) -> bool:
-        """Sleep up to `seconds`; returns True immediately if stop() was called."""
-        return self._stop_event.wait(seconds)
+        """
+        Sleep up to `seconds` while polling ESC every 10 ms.
+        Returns True as soon as stop() is called or ESC is pressed.
+        This means ESC is always responsive during any wait, with no extra thread.
+        """
+        deadline = time.perf_counter() + seconds
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return self._stop_event.is_set()
+            if _esc_pressed():
+                self.stop("Stopped by ESC.")
+                return True
+            if self._stop_event.wait(min(0.010, remaining)):
+                return True
 
     def run(self) -> None:
         cfg       = self.cfg
@@ -388,6 +401,10 @@ class RollWorker(QThread):
             return
 
         while self._running:
+            # ── ESC check at start of each loop ──────────────────
+            if _esc_pressed():
+                self.stop("Stopped by ESC.")
+                break
             # ── Trigger ───────────────────────────────────────────
             if auto_roll:
                 # Auto: previous buy cycle is done → press D immediately
