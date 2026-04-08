@@ -301,6 +301,7 @@ class TFTRollTool(QMainWindow):
         self._selected:       dict[str, int] = {}
         self._buttons:        dict[str, UnitButton] = {}
         self._worker:         RollWorkerV2 | None = None
+        self._esc_watcher:    None = None
         self._auto_capture:   AutoCaptureWorker | None = None
         self._train_img_path: str | None = None
         self._cap_thread:     _CaptureThread | None = None

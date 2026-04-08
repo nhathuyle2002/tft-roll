@@ -127,33 +127,22 @@ class HashMapper:
         self.load()
 
     def load(self) -> int:
-        """Reload from disk, rebuild reverse index, migrate old keys. Returns entry count."""
+        """Reload from disk, rebuild reverse index. Returns entry count."""
         if self._path.exists():
             try:
                 with open(self._path, "r", encoding="utf-8") as f:
                     data: dict[str, str] = json.load(f)
-                # Migrate old format "{slot}_{name}" → "{slot}_{name}_0"
-                migrated: dict[str, str] = {}
-                for key, h in data.items():
-                    after_slot = key.split("_", 1)[1] if "_" in key else key
-                    parts = after_slot.rsplit("_", 1)
-                    if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < MAX_VARIANTS:
-                        migrated[key] = h          # already new format
-                    else:
-                        migrated[f"{key}_0"] = h   # upgrade to variant 0
                 # Build reverse index: hash → name
+                # key format: "{slot}_{name}_{variant}" e.g. "1_Jinx_0"
                 reverse: dict[str, str] = {}
-                for key, h in migrated.items():
-                    # key: "1_Jinx_0" → strip slot prefix, then strip variant suffix
+                for key, h in data.items():
                     after_slot = key.split("_", 1)[1] if "_" in key else key
                     name = after_slot.rsplit("_", 1)[0] if "_" in after_slot else after_slot
                     reverse[h] = name
                 with self._lock:
-                    self._key_to_hash  = dict(sorted(migrated.items()))
+                    self._key_to_hash  = dict(sorted(data.items()))
                     self._hash_to_name = reverse
-                if migrated != data:   # migration happened → persist immediately
-                    self.save()
-                return len(migrated)
+                return len(data)
             except Exception:
                 pass
         return 0
