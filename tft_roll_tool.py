@@ -13,7 +13,6 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QScrollArea, QFrame, QGridLayout,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
     QTextEdit, QSizePolicy, QFileDialog, QButtonGroup, QRadioButton,
-    QComboBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QBrush, QColor
@@ -22,12 +21,11 @@ from tft_backend import (
     OCR_AVAILABLE,
     TFT_UNITS, COST_COLOR, COST_BG, COST_LABEL,
     DEFAULTS,
-    load_positions, save_positions, load_app_settings, save_app_settings,
     ocr_all_slots, ocr_from_image_file,
 )
 from tft_v2_backend import (
     RollWorkerV2, AutoCaptureWorker,
-    capture_once, run_train_on_image,
+    capture_once, run_train_on_image, save_strip_raw,
     get_hashmap, hashmap_path, set_active_resolution, TRAIN_DIR,
 )
 
@@ -306,15 +304,9 @@ class TFTRollTool(QMainWindow):
         self._train_img_path: str | None = None
         self._cap_thread:     _CaptureThread | None = None
 
-        # Load persisted resolution and activate matching hashmap + positions
-        _saved = load_app_settings()
-        _res_str = _saved.get("resolution", "1920x1080")
-        try:
-            _rw, _rh = (int(v) for v in _res_str.split("x", 1))
-        except ValueError:
-            _rw, _rh = 1920, 1080
-        self._active_res: tuple[int, int] = (_rw, _rh)
-        set_active_resolution(_rw, _rh)
+        # Resolution fixed to 1920×1080
+        self._active_res: tuple[int, int] = (1920, 1080)
+        set_active_resolution(1920, 1080)
 
         # Floating log overlay (always-on-top)
         self._overlay = LogOverlay()
@@ -546,17 +538,6 @@ class TFTRollTool(QMainWindow):
     #  Settings tab
     # ─────────────────────────────────────────────────────────
 
-    # Predefined resolution options shown in the dropdown
-    _PRESET_RESOLUTIONS = [
-        "1280x720",
-        "1366x768",
-        "1600x900",
-        "1920x1080",
-        "2560x1440",
-        "3840x2160",
-        "Custom…",
-    ]
-
     def _tab_settings(self) -> QWidget:
         w = QWidget()
         outer = QVBoxLayout(w); outer.setContentsMargins(10, 10, 10, 10)
@@ -566,59 +547,16 @@ class TFTRollTool(QMainWindow):
         inner = QWidget(); lay = QVBoxLayout(inner)
         lay.setAlignment(Qt.AlignTop); lay.setSpacing(6)
 
-        # ── Resolution ────────────────────────────────────────
+        # ── Resolution (fixed) ────────────────────────────────
         lay.addWidget(self._sh("🖥  Display Resolution"))
-
         res_row = QHBoxLayout(); res_row.setSpacing(8)
         res_lbl = QLabel("Resolution:"); res_lbl.setFixedWidth(160)
-
-        self._res_combo = QComboBox()
-        self._res_combo.addItems(self._PRESET_RESOLUTIONS)
-        self._res_combo.setFixedWidth(160)
-        self._res_combo.setStyleSheet(
-            "QComboBox{background:#1a1a2e;color:#ccc;border:1px solid #444;"
-            "border-radius:4px;padding:3px 8px;}"
-            "QComboBox::drop-down{border:none;}"
-            "QComboBox QAbstractItemView{background:#1a1a2e;color:#ccc;selection-background-color:#2a3a5a;}"
-        )
-
-        # Custom resolution spinboxes (only visible when "Custom…" is selected)
-        self._custom_w_sp = QSpinBox()
-        self._custom_w_sp.setRange(640, 7680); self._custom_w_sp.setValue(1920)
-        self._custom_w_sp.setPrefix("W: "); self._custom_w_sp.setFixedWidth(100)
-
-        self._custom_h_sp = QSpinBox()
-        self._custom_h_sp.setRange(480, 4320); self._custom_h_sp.setValue(1080)
-        self._custom_h_sp.setPrefix("H: "); self._custom_h_sp.setFixedWidth(100)
-
-        # Initialise combo to match saved resolution
-        saved_key = f"{self._active_res[0]}x{self._active_res[1]}"
-        if saved_key in self._PRESET_RESOLUTIONS:
-            self._res_combo.setCurrentText(saved_key)
-        else:
-            self._res_combo.setCurrentText("Custom…")
-            self._custom_w_sp.setValue(self._active_res[0])
-            self._custom_h_sp.setValue(self._active_res[1])
-
-        self._custom_w_sp.setVisible(self._res_combo.currentText() == "Custom…")
-        self._custom_h_sp.setVisible(self._res_combo.currentText() == "Custom…")
-
-        self._res_combo.currentTextChanged.connect(self._on_res_combo_changed)
-
+        res_fixed = QLabel("1920×1080  (fixed)")
+        res_fixed.setStyleSheet("color:#58a6ff;font-size:12px;font-weight:bold;")
         res_row.addWidget(res_lbl)
-        res_row.addWidget(self._res_combo)
-        res_row.addWidget(self._custom_w_sp)
-        res_row.addWidget(self._custom_h_sp)
+        res_row.addWidget(res_fixed)
         res_row.addStretch()
         lay.addLayout(res_row)
-
-        res_note = QLabel(
-            "Each resolution uses its own hash map (hashmap_W_H.json).  "
-            "Train Mode always captures at the resolution selected here."
-        )
-        res_note.setStyleSheet("color:#555;font-size:10px;margin-bottom:4px;")
-        res_note.setWordWrap(True)
-        lay.addWidget(res_note)
 
         # ── Timing ────────────────────────────────────────────
         lay.addWidget(self._sh("⏱  Timing"))
@@ -684,22 +622,6 @@ class TFTRollTool(QMainWindow):
         sc.setWidget(inner)
         outer.addWidget(sc)
         return w
-
-    def _on_res_combo_changed(self, text: str) -> None:
-        custom = text == "Custom…"
-        self._custom_w_sp.setVisible(custom)
-        self._custom_h_sp.setVisible(custom)
-
-    def _active_res_from_ui(self) -> tuple[int, int]:
-        """Read the currently selected resolution from the settings UI."""
-        txt = self._res_combo.currentText()
-        if txt == "Custom…":
-            return self._custom_w_sp.value(), self._custom_h_sp.value()
-        try:
-            w, h = (int(v) for v in txt.split("x", 1))
-            return w, h
-        except ValueError:
-            return 1920, 1080
 
     # ─────────────────────────────────────────────────────────
     #  OCR Test tab  (upload image → OCR → inspect results)
@@ -995,33 +917,19 @@ class TFTRollTool(QMainWindow):
             self._buy_delay_sp.setValue(0.005)
 
     def _save_settings(self):
-        # Timing
         DEFAULTS["pre_delay"]     = self._pre_sp.value()
         DEFAULTS["shop_wait"]     = self._shop_wait_sp.value()
         DEFAULTS["buy_delay"]     = self._buy_delay_sp.value()
         DEFAULTS["ocr_threshold"] = self._ocr_thr_sp.value()
-
-        # Resolution — switch hashmap + positions, persist to settings.json
-        rw, rh = self._active_res_from_ui()
-        self._active_res = (rw, rh)
-        set_active_resolution(rw, rh)
-        save_app_settings({"resolution": f"{rw}x{rh}"})
-
-        # Write to position.yaml if this resolution wasn't already there
-        save_positions(rw, rh, {"click_pos":    DEFAULTS["click_pos"],
-                                "name_regions": DEFAULTS["name_regions"]})
-
         self._train_refresh_hm()
         self._settings_status.setText(
-            f"✓ Settings saved  ({rw}×{rh}, "
-            f"{get_hashmap().size} hash entries)."
+            f"✓ Settings saved  (1920×1080, {get_hashmap().size} hash entries)."
         )
 
     def _reset_settings(self):
         self._mode_human.setChecked(True)
         self._pre_sp.setValue(1)
         self._ocr_thr_sp.setValue(0.70)
-        self._res_combo.setCurrentText("1920x1080")
         self._settings_status.setText("↺ Reset to defaults. Click Save to apply.")
 
     # ─────────────────────────────────────────────────────────
@@ -1248,9 +1156,35 @@ class TFTRollTool(QMainWindow):
             "QPushButton:disabled{background:#1e1e1e;color:#555;border-color:#333;}"
         )
         self._btn_manual_cap.clicked.connect(self._train_manual_capture)
+        self._btn_snap_strip = QPushButton("📷  Name Strip Preview")
+        self._btn_snap_strip.setFixedSize(180, 26)
+        self._btn_snap_strip.setStyleSheet(
+            "QPushButton{background:#1a1a2e;color:#bc8cff;border:1px solid #bc8cff;"
+            "border-radius:5px;font-size:11px;}"
+            "QPushButton:hover{background:#2a2a4e;}"
+        )
+        self._btn_snap_strip.clicked.connect(self._train_snap_strip)
+        self._btn_save_strip = QPushButton("💾  Save Strip")
+        self._btn_save_strip.setFixedSize(130, 26)
+        self._btn_save_strip.setStyleSheet(
+            "QPushButton{background:#1a2a1a;color:#ffd700;border:1px solid #ffd700;"
+            "border-radius:5px;font-size:11px;}"
+            "QPushButton:hover{background:#2a3a0a;}"
+        )
+        self._btn_save_strip.clicked.connect(self._train_save_strip_only)
         row2.addWidget(self._btn_manual_cap)
+        row2.addWidget(self._btn_snap_strip)
+        row2.addWidget(self._btn_save_strip)
         row2.addStretch()
         cglay.addLayout(row2)
+        self._strip_preview_lbl = _ScaledImageLabel("Name strip preview will appear here")
+        self._strip_preview_lbl.setFixedHeight(36)
+        self._strip_preview_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._strip_preview_lbl.setStyleSheet(
+            "background:#0d0d0d;border:1px solid #2a2a2a;border-radius:4px;color:#444;"
+        )
+        self._strip_preview_lbl.hide()
+        cglay.addWidget(self._strip_preview_lbl)
         row3 = QHBoxLayout()
         self._btn_auto_cap = QPushButton("▶  Start Auto Capture")
         self._btn_auto_cap.setFixedSize(200, 26)
@@ -1298,6 +1232,62 @@ class TFTRollTool(QMainWindow):
         self._hm_lbl.setText(
             f"Hashmap: {n} entr{'y' if n == 1 else 'ies'}  ·  {hm._path.name}"
         )
+
+    def _train_snap_strip(self):
+        """Grab a live screenshot of the name-region strip and show it as a preview."""
+        try:
+            from PIL import ImageGrab
+            import numpy as np
+            name_regions = DEFAULTS["name_regions"]
+            bx0 = min(r[0] for r in name_regions)
+            by0 = min(r[1] for r in name_regions)
+            bx1 = max(r[0] + r[2] for r in name_regions)
+            by1 = max(r[1] + r[3] for r in name_regions)
+            pil_img = ImageGrab.grab(bbox=(bx0, by0, bx1, by1))
+            img_np  = np.array(pil_img)
+            sh, sw, sch = img_np.shape
+            from PyQt5.QtGui import QImage
+            qimg = QImage(img_np.data, sw, sh, sw * sch, QImage.Format_RGB888)
+            pix  = QPixmap.fromImage(qimg)
+            self._strip_preview_lbl.setSourcePixmap(pix)
+            self._strip_preview_lbl.show()
+            self._cap_status.setText(
+                f"Name strip  {sw}×{sh} px  "
+                f"(x {bx0}–{bx1}, y {by0}–{by1})"
+            )
+        except Exception as e:
+            self._cap_status.setText(f"Snap error: {e}")
+
+    def _train_save_strip_only(self):
+        """Capture the name-region strip and save it to train/ — no OCR or hashing."""
+        try:
+            from PIL import ImageGrab
+            import cv2 as _cv2
+            import numpy as np
+            name_regions = DEFAULTS["name_regions"]
+            bx0 = min(r[0] for r in name_regions)
+            by0 = min(r[1] for r in name_regions)
+            bx1 = max(r[0] + r[2] for r in name_regions)
+            by1 = max(r[1] + r[3] for r in name_regions)
+            pil_img = ImageGrab.grab(bbox=(bx0, by0, bx1, by1))
+            img_rgb = np.array(pil_img)
+            img_bgr = _cv2.cvtColor(img_rgb, _cv2.COLOR_RGB2BGR)
+            idx = save_strip_raw(img_bgr)
+            sh, sw = img_bgr.shape[:2]
+            # Update preview
+            from PyQt5.QtGui import QImage
+            qimg = QImage(img_rgb.data, sw, sh, sw * img_rgb.shape[2], QImage.Format_RGB888)
+            pix  = QPixmap.fromImage(qimg)
+            self._strip_preview_lbl.setSourcePixmap(pix)
+            self._strip_preview_lbl.show()
+            path = TRAIN_DIR / f"{idx}_image.png"
+            self._cap_status.setText(
+                f"Saved strip → {path.name}  ({sw}×{sh} px)"
+            )
+            _line = f"<span style='color:#ffd700;'>[Save Strip] #{idx} saved → {path.name}  ({sw}×{sh})</span>"
+            self._train_log.append(_line)
+        except Exception as e:
+            self._cap_status.setText(f"Save error: {e}")
 
     def _train_browse(self):
         path, _ = QFileDialog.getOpenFileName(

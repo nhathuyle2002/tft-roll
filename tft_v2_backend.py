@@ -320,11 +320,10 @@ def ocr_all_slots_v2(name_regions: list, threshold: float) -> list[dict]:
 
     from PIL import ImageGrab
 
-    pad       = 4
     band_x0   = min(r[0] for r in name_regions)
-    band_y0   = min(r[1] for r in name_regions) - pad
+    band_y0   = min(r[1] for r in name_regions)
     band_x1   = max(r[0] + r[2] for r in name_regions)
-    band_y1   = max(r[1] + r[3] for r in name_regions) + pad
+    band_y1   = max(r[1] + r[3] for r in name_regions)
     try:
         full_rgb = np.array(ImageGrab.grab(bbox=(band_x0, band_y0, band_x1, band_y1)))
     except Exception as e:
@@ -336,7 +335,7 @@ def ocr_all_slots_v2(name_regions: list, threshold: float) -> list[dict]:
         i, (rx, ry, rw, rh) = args
         t0   = time.perf_counter()
         y0   = ry - band_y0
-        crop = full_rgb[y0 - pad : y0 + rh + pad, rx - band_x0 : rx - band_x0 + rw]
+        crop = full_rgb[y0 : y0 + rh, rx - band_x0 : rx - band_x0 + rw]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         return lookup_or_ocr(gray, i + 1, threshold, all_names,
                              (time.perf_counter() - t0) * 1000)
@@ -377,6 +376,14 @@ def save_train_sample(img_bgr: np.ndarray, result_lines: list[str],
     return idx
 
 
+def save_strip_raw(img_bgr: np.ndarray) -> int:
+    """Save a raw strip image to train/ with no OCR/hash processing. Returns idx."""
+    TRAIN_DIR.mkdir(exist_ok=True)
+    idx = _next_train_idx()
+    cv2.imwrite(str(TRAIN_DIR / f"{idx}_image.png"), img_bgr)
+    return idx
+
+
 def capture_once(name_regions: list, threshold: float) -> tuple[int, list[dict]]:
     """
     Single screen grab → hash+OCR on all slots → save train sample.
@@ -387,11 +394,10 @@ def capture_once(name_regions: list, threshold: float) -> tuple[int, list[dict]]
 
     from PIL import ImageGrab
 
-    pad       = 4
     band_x0   = min(r[0] for r in name_regions)
-    band_y0   = min(r[1] for r in name_regions) - pad
+    band_y0   = min(r[1] for r in name_regions)
     band_x1   = max(r[0] + r[2] for r in name_regions)
-    band_y1   = max(r[1] + r[3] for r in name_regions) + pad
+    band_y1   = max(r[1] + r[3] for r in name_regions)
     pil_img   = ImageGrab.grab(bbox=(band_x0, band_y0, band_x1, band_y1))
     full_rgb  = np.array(pil_img)
     all_names = [n for names in TFT_UNITS.values() for n in names]
@@ -400,7 +406,7 @@ def capture_once(name_regions: list, threshold: float) -> tuple[int, list[dict]]
     for i, (rx, ry, rw, rh) in enumerate(name_regions):
         t0   = time.perf_counter()
         y0   = ry - band_y0
-        crop = full_rgb[y0 - pad : y0 + rh + pad, rx - band_x0 : rx - band_x0 + rw]
+        crop = full_rgb[y0 : y0 + rh, rx - band_x0 : rx - band_x0 + rw]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         results.append(
             lookup_or_ocr(gray, i + 1, threshold, all_names,
@@ -459,7 +465,15 @@ def run_train_on_image(img_path: str, name_regions: list,
             f"  hash={r.get('hash', '')[:8]}"
             for r in results
         ]
-        save_train_sample(img_cv, lines, results)
+        # Crop to name-region strip only — same bounding box as capture_once uses.
+        scaled = [[int(rx * sx), int(ry * sy), int(rw * sx), int(rh * sy)]
+                  for rx, ry, rw, rh in name_regions]
+        bx0 = min(r[0] for r in scaled)
+        by0 = min(r[1] for r in scaled)
+        bx1 = max(r[0] + r[2] for r in scaled)
+        by1 = min(img_h, max(r[1] + r[3] for r in scaled))
+        strip_cv = img_cv[by0:by1, bx0:bx1]
+        save_train_sample(strip_cv, lines, results)
     return results
 
 

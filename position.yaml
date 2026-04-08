@@ -73,19 +73,19 @@
 1920x1080:
   slot_1:
     click_position: {x: 575, y: 992}
-    unit_name_region: {x: 480, y: 1045, w: 145, h: 20}
+    unit_name_region: {x: 483, y: 1048, w: 100, h: 14}
   slot_2:
     click_position: {x: 775, y: 992}
-    unit_name_region: {x: 685, y: 1045, w: 145, h: 20}
+    unit_name_region: {x: 684, y: 1048, w: 100, h: 14}
   slot_3:
     click_position: {x: 975, y: 992}
-    unit_name_region: {x: 885, y: 1045, w: 145, h: 20}
+    unit_name_region: {x: 885, y: 1048, w: 100, h: 14}
   slot_4:
     click_position: {x: 1175, y: 992}
-    unit_name_region: {x: 1085, y: 1045, w: 145, h: 20}
+    unit_name_region: {x: 1087, y: 1048, w: 100, h: 14}
   slot_5:
     click_position: {x: 1375, y: 992}
-    unit_name_region: {x: 1290, y: 1045, w: 145, h: 20}
+    unit_name_region: {x: 1288, y: 1048, w: 100, h: 14}
 
 2560x1440:
   slot_1:
