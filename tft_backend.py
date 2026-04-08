@@ -6,19 +6,28 @@ Imported by tft_roll_tool.py (UI) and usable standalone / in tests.
 import time
 import difflib
 import ctypes
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
-import pydirectinput
-pydirectinput.FAILSAFE = False
+# ── Windows-only input layer ──────────────────────────────────────────────────
+# On macOS/Linux the app still launches for UI testing; input calls are no-ops.
+import platform as _platform
+_IS_WINDOWS = _platform.system() == "Windows"
 
-# ── Win32 helpers ─────────────────────────────────────────────────────────────
-_user32 = ctypes.windll.user32
+if _IS_WINDOWS:
+    import pydirectinput
+    pydirectinput.FAILSAFE = False
+    _user32 = ctypes.windll.user32
+else:
+    pydirectinput = None  # type: ignore
+    _user32       = None  # type: ignore
 
 _VK_ESCAPE = 0x1B
 _VK_D      = 0x44   # 'D' virtual key code
 
 def _d_pressed() -> bool:
-    """True while D is held down (high-order bit set)."""
+    if not _IS_WINDOWS or _user32 is None:
+        return False
     try:
         return bool(_user32.GetAsyncKeyState(_VK_D) & 0x8000)
     except Exception:
@@ -32,6 +41,8 @@ _TFT_TITLES   = [
 
 
 def _find_tft_hwnd() -> int:
+    if not _IS_WINDOWS or _user32 is None:
+        return 0
     for title in _TFT_TITLES:
         hwnd = _user32.FindWindowW(None, title)
         if hwnd:
@@ -40,14 +51,17 @@ def _find_tft_hwnd() -> int:
 
 
 def _focus_tft() -> None:
-    """Bring the TFT window to the foreground so clicks register."""
+    if not _IS_WINDOWS or _user32 is None:
+        return
     hwnd = _find_tft_hwnd()
     if hwnd:
         _user32.SetForegroundWindow(hwnd)
-        time.sleep(0.05)   # let the OS settle focus
+        time.sleep(0.05)
 
 
 def _esc_pressed() -> bool:
+    if not _IS_WINDOWS or _user32 is None:
+        return False
     try:
         return bool(_user32.GetAsyncKeyState(_VK_ESCAPE) & 0x8000)
     except Exception:
@@ -55,7 +69,8 @@ def _esc_pressed() -> bool:
 
 
 def _press(key: str) -> None:
-    pydirectinput.press(key)
+    if _IS_WINDOWS and pydirectinput is not None:
+        pydirectinput.press(key)
 
 
 # Mouse movement: SetCursorPos (no SendInput, not intercepted by Vanguard)
@@ -65,12 +80,8 @@ _MOUSEEVENTF_LEFTUP   = 0x0004
 
 
 def _click(x: int, y: int) -> None:
-    """
-    SetCursorPos  → moves cursor without going through SendInput at all.
-    mouse_event   → legacy Win32 click API (older than SendInput, different
-                    Vanguard hook path than pydirectinput/pyautogui).
-    SetForegroundWindow is called once per cycle before this (in the worker).
-    """
+    if not _IS_WINDOWS or _user32 is None:
+        return
     _user32.SetCursorPos(x, y)
     time.sleep(0.05)
     _user32.mouse_event(_MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
@@ -115,11 +126,11 @@ COST_LABEL = {1: "● Cost 1", 2: "●● Cost 2", 3: "●●● Cost 3",
 
 # ── Defaults (1920×1080 fullscreen) ──────────────────────────────────────────
 DEFAULTS = {
-    # Timing
-    "roll_delay":    1.5,   # seconds between each D press
-    "pre_delay":     3,     # countdown before automation starts
-    "shop_wait":     0.5,   # seconds to wait after rolling for shop to load
-    "buy_delay":     0.12,  # seconds between clicking each shop slot
+    # Timing  (Human mode defaults — ~0.3s RTT)
+    "roll_delay":    1.5,   # seconds between each D press (auto roll)
+    "pre_delay":     1,     # countdown before automation starts
+    "shop_wait":     0.15,  # seconds to wait after rolling for shop to load
+    "buy_delay":     0.05,  # seconds between clicking each shop slot
 
     # OCR
     "ocr_threshold": 0.50,
@@ -204,6 +215,35 @@ def ocr_unit_name(region: list, threshold: float) -> str:
     return best_raw
 
 
+def _ocr_gray(gray, slot: int, threshold: float, all_names: list,
+              crop_ms: float) -> dict:
+    """
+    Core per-slot OCR: run Tesseract on a grayscale crop and return a result dict.
+    Used by both ocr_all_slots (live screen) and ocr_from_image_file (file).
+    """
+    t_ocr = time.perf_counter()
+    best_raw, best_score = "", 0.0
+    for variant in _preprocess_variants(gray):
+        raw = pytesseract.image_to_string(variant, config=_OCR_CONFIG).strip()
+        if not raw:
+            continue
+        _, s = _best_fuzzy(raw, all_names)
+        if s > best_score:
+            best_score, best_raw = s, raw
+    ocr_ms = (time.perf_counter() - t_ocr) * 1000
+
+    best_name, score = _best_fuzzy(best_raw, all_names)
+    return {
+        "slot":           slot,
+        "raw":            best_raw,
+        "match":          best_name if score >= threshold else None,
+        "score":          round(score, 2),
+        "best_candidate": best_name,
+        "crop_ms":        round(crop_ms, 1),
+        "ocr_ms":         round(ocr_ms, 1),
+    }
+
+
 def ocr_all_slots(name_regions: list, threshold: float) -> list[dict]:
     """
     Read all 5 shop slots from the live screen.
@@ -228,36 +268,12 @@ def ocr_all_slots(name_regions: list, threshold: float) -> list[dict]:
 
     def _ocr_slot(args):
         i, (rx, ry, rw, rh) = args
-
-        # ── crop timing ──────────────────────────────────────
         t_crop = time.perf_counter()
         y0   = ry - band_y0
         crop = full_rgb[y0 - pad : y0 + rh + pad, rx - band_x0 : rx - band_x0 + rw]
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         crop_ms = (time.perf_counter() - t_crop) * 1000
-
-        # ── OCR timing ───────────────────────────────────────
-        t_ocr = time.perf_counter()
-        best_raw, best_score = "", 0.0
-        for variant in _preprocess_variants(gray):
-            raw = pytesseract.image_to_string(variant, config=_OCR_CONFIG).strip()
-            if not raw:
-                continue
-            _, s = _best_fuzzy(raw, all_names)
-            if s > best_score:
-                best_score, best_raw = s, raw
-        ocr_ms = (time.perf_counter() - t_ocr) * 1000
-
-        best_name, score = _best_fuzzy(best_raw, all_names)
-        return {
-            "slot":           i + 1,
-            "raw":            best_raw,
-            "match":          best_name if score >= threshold else None,
-            "score":          round(score, 2),
-            "best_candidate": best_name,
-            "crop_ms":        round(crop_ms, 1),
-            "ocr_ms":         round(ocr_ms, 1),
-        }
+        return _ocr_gray(gray, i + 1, threshold, all_names, crop_ms)
 
     with ThreadPoolExecutor(max_workers=len(name_regions)) as pool:
         results = list(pool.map(_ocr_slot, enumerate(name_regions)))
@@ -269,49 +285,37 @@ def ocr_from_image_file(img_path: str, name_regions: list,
     """
     Run OCR on a saved screenshot file.
     Auto-scales name_regions from 1920×1080 to the image dimensions.
-    Returns list of {slot, raw, match, score, best_candidate, img_size, scaled_region}.
+    Uses the same _ocr_gray core as ocr_all_slots.
+    Returns list of {slot, raw, match, score, best_candidate, crop_ms, ocr_ms,
+                     img_size, scaled_region}.
     """
     if not OCR_AVAILABLE:
         return []
 
     from PIL import Image as _Image
-    img_pil          = _Image.open(img_path).convert("RGB")
-    img_w, img_h     = img_pil.size
-    img_cv           = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    img_pil      = _Image.open(img_path).convert("RGB")
+    img_w, img_h = img_pil.size
+    img_cv       = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-    REF_W, REF_H     = 1920, 1080
-    sx, sy           = img_w / REF_W, img_h / REF_H
-    all_names        = [n for names in TFT_UNITS.values() for n in names]
-    results          = []
+    REF_W, REF_H = 1920, 1080
+    sx, sy       = img_w / REF_W, img_h / REF_H
+    all_names    = [n for names in TFT_UNITS.values() for n in names]
+    results      = []
 
     for i, (rx, ry, rw, rh) in enumerate(name_regions):
-        x   = int(rx * sx);  y  = int(ry * sy)
-        w   = int(rw * sx);  h  = int(rh * sy)
-        y0  = max(0, y);     y1 = min(img_h, y + h)
+        x  = int(rx * sx);  y  = int(ry * sy)
+        w  = int(rw * sx);  h  = int(rh * sy)
+        y0 = max(0, y);     y1 = min(img_h, y + h)
 
-        crop = img_cv[y0:y1, x:x + w]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        t_crop = time.perf_counter()
+        crop   = img_cv[y0:y1, x:x + w]
+        gray   = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        crop_ms = (time.perf_counter() - t_crop) * 1000
 
-        best_raw, best_score = "", 0.0
-        for variant in _preprocess_variants(gray):
-            raw = pytesseract.image_to_string(variant, config=_OCR_CONFIG).strip()
-            if not raw:
-                continue
-            _, score = _best_fuzzy(raw, all_names)
-            if score > best_score:
-                best_score = score
-                best_raw   = raw
-
-        best_name, score = _best_fuzzy(best_raw, all_names)
-        results.append({
-            "slot":           i + 1,
-            "raw":            best_raw,
-            "match":          best_name if score >= threshold else None,
-            "score":          round(score, 2),
-            "best_candidate": best_name,
-            "img_size":       (img_w, img_h),
-            "scaled_region":  [x, y, w, h],
-        })
+        result = _ocr_gray(gray, i + 1, threshold, all_names, crop_ms)
+        result["img_size"]      = (img_w, img_h)
+        result["scaled_region"] = [x, y, w, h]
+        results.append(result)
 
     return results
 
@@ -328,6 +332,30 @@ def fuzzy_match(ocr_text: str, wanted: list, threshold: float) -> str | None:
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
+class EscWatcher(QThread):
+    """
+    Dedicated thread that polls the ESC key independently of the roll loop.
+    Emits `triggered` the moment ESC is held, then exits.
+    Connect `triggered` to worker.stop() for instant cancellation regardless
+    of what state the roll loop is in (sleeping, buying, waiting for D, etc.).
+    """
+    triggered = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._stop_event = threading.Event()
+
+    def run(self) -> None:
+        # Poll every 5 ms — unblocks immediately when stop() is called
+        while not self._stop_event.wait(0.005):
+            if _esc_pressed():
+                self.triggered.emit()
+                break   # one-shot: fire once and exit
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
 class RollWorker(QThread):
     status_signal = pyqtSignal(str)
     roll_signal   = pyqtSignal(int)
@@ -336,61 +364,75 @@ class RollWorker(QThread):
 
     def __init__(self, cfg: dict):
         super().__init__()
-        self.cfg      = cfg
-        self._running = False
+        self.cfg         = cfg
+        self._stop_event = threading.Event()
+        self._reason     = "Stopped."
+
+    @property
+    def _running(self) -> bool:
+        return not self._stop_event.is_set()
+
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep up to `seconds`; returns True immediately if stop() was called."""
+        return self._stop_event.wait(seconds)
 
     def run(self) -> None:
-        self._running = True
-        cfg      = self.cfg
-        count    = 0
-        reason   = "Stopped."
-        listen_d = cfg.get("listen_d", True)   # True = wait for user D press (default)
+        cfg       = self.cfg
+        count     = 0
         auto_roll = cfg.get("auto_roll", False)
+        bot_mode  = cfg.get("bot_mode", False)
 
         self.status_signal.emit(f"Starting in {cfg['pre_delay']}s – switch to TFT!")
-        time.sleep(cfg["pre_delay"])
-
-        if listen_d:
-            self.status_signal.emit("Waiting for D key press…")
+        if self._sleep(cfg["pre_delay"]):
+            self.status_signal.emit(self._reason)
+            return
 
         while self._running:
-            # ── ESC = instant stop ────────────────────────────────
-            if _esc_pressed():
-                reason = "Stopped by ESC."
-                break
-
-            # ── Trigger: wait for D press OR enter auto scan ──────
-            if listen_d:
-                # Wait until D goes down
-                while self._running:
-                    if _esc_pressed():
-                        reason = "Stopped by ESC."
-                        self._running = False
-                        break
-                    if _d_pressed():
-                        break
-                    time.sleep(0.015)
-                if not self._running:
-                    break
-                # Wait for D to be released (avoid re-triggering while held)
-                while self._running and _d_pressed():
-                    time.sleep(0.015)
+            # ── Trigger ───────────────────────────────────────────
+            if auto_roll:
+                # Auto: previous buy cycle is done → press D immediately
+                _focus_tft()
+                _press("d")
                 count += 1
                 self.roll_signal.emit(count)
-                # Let the shop finish loading
-                time.sleep(cfg["shop_wait"])
+            else:
+                # Manual: wait for user to press D
+                self.status_signal.emit("Waiting for D key press…")
+                while self._running:
+                    if _d_pressed():
+                        break
+                    self._sleep(0.015)
+                if not self._running:
+                    break
+                # Wait for key release to avoid re-triggering
+                while self._running and _d_pressed():
+                    self._sleep(0.015)
+                if not self._running:
+                    break
+                count += 1
+                self.roll_signal.emit(count)
+                _focus_tft()
 
-            # ── OCR + buy ─────────────────────────────────────────
-            if _esc_pressed():
-                reason = "Stopped by ESC."
+            if not self._running:
                 break
-            _focus_tft()
-            t0 = time.perf_counter()
 
-            results = ocr_all_slots(cfg["name_regions"], cfg["ocr_threshold"])
-            ocr_ms  = (time.perf_counter() - t0) * 1000
+            # ── OCR (in BOT mode runs parallel with shop_wait) ────
+            t0 = time.perf_counter()
+            if bot_mode:
+                fut = ThreadPoolExecutor(max_workers=1).submit(
+                    ocr_all_slots, cfg["name_regions"], cfg["ocr_threshold"])
+                self._sleep(cfg["shop_wait"])   # exits early on stop
+                if not self._running:
+                    break
+                results = fut.result()         # blocks only if OCR not done yet
+            else:
+                if self._sleep(cfg["shop_wait"]):
+                    break
+                results = ocr_all_slots(cfg["name_regions"], cfg["ocr_threshold"])
+            ocr_ms = (time.perf_counter() - t0) * 1000
             self.shop_signal.emit(results)
 
+            # ── Buy matched slots ─────────────────────────────────
             bought = []
             for r, pos in zip(results, cfg["click_pos"]):
                 if not self._running:
@@ -400,44 +442,19 @@ class RollWorker(QThread):
                     bought.append(r["match"])
                     self.found_signal.emit(
                         f"Slot {r['slot']} → {r['match']} ✓  ('{r['raw']}')")
-                    time.sleep(cfg["buy_delay"])
+                    if self._sleep(cfg["buy_delay"]):
+                        break
+
+            if not self._running:
+                break
 
             bought_str = ", ".join(bought) if bought else "none"
-            ocr_tag    = f"  [{ocr_ms:.0f} ms]" if ocr_ms else ""
+            ocr_tag    = f"  [{ocr_ms:.0f} ms]"
+            self.status_signal.emit(
+                f"Roll {count}{ocr_tag}  |  bought: {bought_str}")
 
-            # ── Roll / wait ───────────────────────────────────────
-            if not listen_d and auto_roll and self._running:
-                _press("d")
-                count += 1
-                self.roll_signal.emit(count)
-                self.status_signal.emit(
-                    f"Roll {count}{ocr_tag}  |  bought: {bought_str}")
-                elapsed, step = 0.0, 0.05
-                while elapsed < cfg["roll_delay"] and self._running:
-                    if _esc_pressed():
-                        reason = "Stopped by ESC."
-                        self._running = False
-                        break
-                    time.sleep(step)
-                    elapsed += step
-            elif listen_d:
-                self.status_signal.emit(
-                    f"Roll {count}{ocr_tag}  |  bought: {bought_str}")
-                self.status_signal.emit("Waiting for D key press…")
-            else:
-                # auto scan without auto roll — wait shop_wait then re-scan
-                self.status_signal.emit(
-                    f"Scan{ocr_tag}  |  bought: {bought_str}")
-                elapsed, step = 0.0, 0.05
-                while elapsed < cfg["shop_wait"] and self._running:
-                    if _esc_pressed():
-                        reason = "Stopped by ESC."
-                        self._running = False
-                        break
-                    time.sleep(step)
-                    elapsed += step
+        self.status_signal.emit(self._reason)
 
-        self.status_signal.emit(reason)
-
-    def stop(self) -> None:
-        self._running = False
+    def stop(self, reason: str = "Stopped.") -> None:
+        self._reason = reason
+        self._stop_event.set()

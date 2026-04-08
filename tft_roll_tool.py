@@ -8,27 +8,24 @@ Usage: python tft_roll_tool.py
 import os
 import sys
 
-import pyautogui
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QScrollArea, QFrame, QGridLayout,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
     QTextEdit, QSizePolicy, QFileDialog, QButtonGroup, QRadioButton,
 )
-from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QFont, QPixmap, QPainter, QBrush, QColor, QPen
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QPixmap, QPainter, QBrush, QColor
 
 from tft_backend import (
     OCR_AVAILABLE,
     TFT_UNITS, COST_COLOR, COST_BG, COST_LABEL,
     DEFAULTS,
     ocr_all_slots, ocr_from_image_file,
-    RollWorker,
+    RollWorker, EscWatcher,
 )
 # pyqtSignal is re-exported for the overlay / chip widgets defined here
 from PyQt5.QtCore import pyqtSignal
-
-pyautogui.FAILSAFE = True  # move mouse to top-left corner to emergency-stop
 
 
 # ─────────────────────────────────────────────────────────────
@@ -85,137 +82,6 @@ class UnitButton(QPushButton):
     def set_selected(self, v: bool):
         self._sel = v; self._style()
 
-
-# ─────────────────────────────────────────────────────────────
-#  Full-screen region selector overlay
-# ─────────────────────────────────────────────────────────────
-
-class ScreenRegionSelector(QWidget):
-    """
-    Fullscreen overlay that shows a screenshot of the desktop as background.
-    User drags a rectangle → emits region_selected(x, y, w, h) → closes.
-    A separate `closed` signal is always emitted on close so the caller
-    can restore its own window reliably.
-    """
-    region_selected = pyqtSignal(int, int, int, int)
-    closed          = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        # ── Capture the screen BEFORE the window appears ──────────────
-        screen = QApplication.primaryScreen()
-        self._bg: QPixmap = screen.grabWindow(0)   # real screenshot background
-
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.showFullScreen()
-        self.setCursor(Qt.CrossCursor)
-
-        self._origin:  QPoint | None = None
-        self._current: QPoint | None = None
-        self._dragging = False
-
-    # ── painting ──────────────────────────────────────────────────────
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-
-        # 1. Draw the captured screenshot so the screen looks normal
-        painter.drawPixmap(0, 0, self._bg)
-
-        dim = QColor(0, 0, 0, 150)
-        sw, sh = self.width(), self.height()
-
-        if self._origin and self._current:
-            sel = self._selection_rect()
-
-            # 2. Dim everything EXCEPT the selected rectangle (4-rect method)
-            painter.fillRect(0,           0,          sw, sel.top(),    dim)  # top
-            painter.fillRect(0,           sel.bottom()+1, sw, sh,       dim)  # bottom
-            painter.fillRect(0,           sel.top(),  sel.left(), sel.height(), dim)  # left
-            painter.fillRect(sel.right()+1, sel.top(), sw,        sel.height(), dim)  # right
-
-            # 3. Gold border
-            painter.setPen(QPen(QColor("#ffd700"), 2, Qt.SolidLine))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(sel)
-
-            # 4. Size label
-            painter.setPen(QColor("#ffd700"))
-            painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
-            ly = sel.y() - 24 if sel.y() > 30 else sel.bottom() + 20
-            painter.drawText(sel.x() + 4, ly, f"{sel.width()} × {sel.height()} px")
-
-            # 5. Dashed column dividers (5 slots preview)
-            if sel.width() > 50:
-                painter.setPen(QPen(QColor("#ffd70099"), 1, Qt.DashLine))
-                slot_w = sel.width() / 5
-                for i in range(1, 5):
-                    dx = int(sel.x() + slot_w * i)
-                    painter.drawLine(dx, sel.top(), dx, sel.bottom())
-
-                # Slot number labels
-                painter.setPen(QColor("#ffd700"))
-                painter.setFont(QFont("Segoe UI", 9))
-                for i in range(5):
-                    lx = int(sel.x() + slot_w * i + slot_w / 2 - 4)
-                    painter.drawText(lx, sel.top() + 16, str(i + 1))
-
-        else:
-            # No selection started yet — dim full screen
-            painter.fillRect(self.rect(), dim)
-
-        # Instruction banner
-        painter.setPen(QColor("white"))
-        painter.setFont(QFont("Segoe UI", 13))
-        painter.drawText(
-            self.rect(),
-            Qt.AlignTop | Qt.AlignHCenter,
-            "\n  Drag to select the shop bar (all 5 slots)  ·  ESC to cancel  "
-        )
-
-    # ── mouse events ──────────────────────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._origin   = event.pos()
-            self._current  = event.pos()
-            self._dragging = True
-
-    def mouseMoveEvent(self, event):
-        if self._dragging:
-            self._current = event.pos()
-            self.update()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self._dragging:
-            self._current  = event.pos()
-            self._dragging = False
-            sel = self._selection_rect()
-            if sel.width() > 20 and sel.height() > 10:
-                self.region_selected.emit(sel.x(), sel.y(), sel.width(), sel.height())
-            self.close()
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
-
-    def closeEvent(self, event):
-        self.closed.emit()       # always fires → main window re-shows itself
-        super().closeEvent(event)
-
-    # ── helper ────────────────────────────────────────────────────────
-
-    def _selection_rect(self) -> QRect:
-        x1 = min(self._origin.x(),  self._current.x())
-        y1 = min(self._origin.y(),  self._current.y())
-        x2 = max(self._origin.x(),  self._current.x())
-        y2 = max(self._origin.y(),  self._current.y())
-        return QRect(x1, y1, x2 - x1, y2 - y1)
-
-
-# ─────────────────────────────────────────────────────────────
-#  Main Window
-# ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
 #  Always-on-top log overlay
@@ -342,21 +208,19 @@ class LogOverlay(QWidget):
             raw   = s.get("raw") or ""
             match = s["match"]
             cand  = s.get("best_candidate") or ""
+            t     = f"<span style='color:#444;font-size:9px;'>[{s['crop_ms']}+{s['ocr_ms']}ms]</span>"
             if match:
-                # OCR success + in wanted list
                 parts.append(
-                    f"S{s['slot']} → <span style='color:#56d364;font-weight:bold;'>{match} ✓</span>"
+                    f"S{s['slot']} → <span style='color:#56d364;font-weight:bold;'>{match} ✓</span>{t}"
                 )
             elif raw:
-                # OCR success + not in wanted list
                 label = cand if cand else raw
                 parts.append(
-                    f"S{s['slot']} → <span style='color:#666;'>{label} ✗</span>"
+                    f"S{s['slot']} → <span style='color:#666;'>{label} ✗</span>{t}"
                 )
             else:
-                # OCR failed to read anything
                 parts.append(
-                    f"S{s['slot']} <span style='color:#c9650a;'>⚠ failed</span>"
+                    f"S{s['slot']} <span style='color:#c9650a;'>⚠ failed</span>{t}"
                 )
         self.append_log("  ".join(parts))
 
@@ -412,9 +276,10 @@ class TFTRollTool(QMainWindow):
         self.setMinimumSize(920, 680)
         self.resize(1000, 740)
 
-        self._selected: dict[str, int] = {}
-        self._buttons:  dict[str, UnitButton] = {}
-        self._worker:   RollWorker | None = None
+        self._selected:     dict[str, int] = {}
+        self._buttons:      dict[str, UnitButton] = {}
+        self._worker:       RollWorker | None = None
+        self._esc_watcher:  EscWatcher | None = None
 
         # Floating log overlay (always-on-top)
         self._overlay = LogOverlay()
@@ -530,47 +395,42 @@ class TFTRollTool(QMainWindow):
         )
         rl3.addWidget(di_badge)
 
-        self._autoroll_cb = QCheckBox("Auto Roll – script presses D after each scan")
+        self._autoroll_cb = QCheckBox("Auto Roll – script presses D automatically")
         self._autoroll_cb.setChecked(False)
         self._autoroll_cb.setStyleSheet("color:#c9d1d9;font-size:11px;")
         self._autoroll_cb.setToolTip(
-            "ON: script presses D to reroll after scanning & buying.\n"
-            "OFF: script only scans & buys — you roll manually.\n"
-            "(Has no effect in Listen D press mode.)"
+            "ON:  script presses D after every buy cycle (bot rolls for you).\n"
+            "OFF: you press D manually; script detects it and buys."
         )
         rl3.addWidget(self._autoroll_cb)
 
-        # ── Scan trigger mode ─────────────────────────────────────────
-        trigger_label = QLabel("Scan trigger:")
-        trigger_label.setStyleSheet("color:#8b949e;font-size:11px;margin-top:4px;")
-        rl3.addWidget(trigger_label)
+        # ── Buy speed mode ────────────────────────────────────
+        self._mode_group = QButtonGroup(self)
+        mode_row = QHBoxLayout(); mode_row.setSpacing(12)
 
-        self._trigger_group = QButtonGroup(self)
-        trigger_row = QHBoxLayout()
-        trigger_row.setSpacing(12)
-
-        self._trigger_listen = QRadioButton("Listen D press  (default)")
-        self._trigger_listen.setChecked(True)   # default
-        self._trigger_listen.setStyleSheet("color:#c9d1d9;font-size:11px;")
-        self._trigger_listen.setToolTip(
-            "Scan + buy automatically whenever YOU press D in-game.\n"
-            "The script detects the key and reads the new shop."
+        self._mode_human = QRadioButton("👤  Human  (natural timing)")
+        self._mode_human.setChecked(True)
+        self._mode_human.setStyleSheet("color:#c9d1d9;font-size:11px;")
+        self._mode_human.setToolTip(
+            "Natural buy speed — shop_wait 0.15 s, buy_delay 0.05 s.\n"
+            "Works with both manual and auto roll."
         )
 
-        self._trigger_auto = QRadioButton("Auto  (timed loop)")
-        self._trigger_auto.setChecked(False)
-        self._trigger_auto.setStyleSheet("color:#c9d1d9;font-size:11px;")
-        self._trigger_auto.setToolTip(
-            "Scan + buy on a fixed timer (shop_wait interval).\n"
-            "Combine with Auto Roll to have the script roll for you."
+        self._mode_bot = QRadioButton("🤖  BOT  (fastest buy)")
+        self._mode_bot.setChecked(False)
+        self._mode_bot.setStyleSheet("color:#c9d1d9;font-size:11px;")
+        self._mode_bot.setToolTip(
+            "Fastest buy speed — OCR runs parallel with shop_wait 0.1 s, buy_delay 0.005 s.\n"
+            "Works with both manual and auto roll."
         )
 
-        self._trigger_group.addButton(self._trigger_listen, 0)
-        self._trigger_group.addButton(self._trigger_auto,   1)
-        trigger_row.addWidget(self._trigger_listen)
-        trigger_row.addWidget(self._trigger_auto)
-        trigger_row.addStretch()
-        rl3.addLayout(trigger_row)
+        self._mode_group.addButton(self._mode_human, 0)
+        self._mode_group.addButton(self._mode_bot,   1)
+        mode_row.addWidget(self._mode_human)
+        mode_row.addWidget(self._mode_bot)
+        mode_row.addStretch()
+        rl3.addLayout(mode_row)
+        self._mode_human.toggled.connect(self._apply_mode_preset)
 
         if not OCR_AVAILABLE:
             warn = QLabel("⚠  OCR libs not installed — buying is disabled.\n"
@@ -660,20 +520,16 @@ class TFTRollTool(QMainWindow):
         # ── Timing ────────────────────────────────────────────
         lay.addWidget(self._sh("⏱  Timing"))
 
-        self._roll_sp = self._dspin(
-            0.5, 10.0, DEFAULTS["roll_delay"], 0.25, " sec",
-            "Roll every  (seconds between each D press)"
-        )
         self._pre_sp = self._ispin(
             1, 15, DEFAULTS["pre_delay"], " sec",
             "Start delay  (countdown before automation begins)"
         )
         self._shop_wait_sp = self._dspin(
-            0.1, 3.0, DEFAULTS["shop_wait"], 0.1, " sec",
+            0.05, 3.0, DEFAULTS["shop_wait"], 0.05, " sec",
             "Shop load wait  (pause after rolling for shop to populate)"
         )
         self._buy_delay_sp = self._dspin(
-            0.05, 1.0, DEFAULTS["buy_delay"], 0.05, " sec",
+            0.005, 1.0, DEFAULTS["buy_delay"], 0.005, " sec",
             "Buy speed  (delay between clicking each shop slot)"
         )
         self._ocr_thr_sp = self._dspin(
@@ -681,7 +537,6 @@ class TFTRollTool(QMainWindow):
             "OCR match threshold  (higher = stricter matching, 0.62 recommended)"
         )
         for label, spin in [
-            ("Roll every:",          self._roll_sp),
             ("Start delay:",         self._pre_sp),
             ("Shop load wait:",      self._shop_wait_sp),
             ("Buy speed:",           self._buy_delay_sp),
@@ -900,11 +755,15 @@ class TFTRollTool(QMainWindow):
             f"</span>"
         )
         matched = 0
+        total_ms = 0.0
         for r in results:
             raw  = r.get("raw") or ""
             cand = r.get("best_candidate") or ""
             reg  = r["scaled_region"]
             hit  = r["match"] is not None
+            crop_ms = r.get("crop_ms", 0)
+            ocr_ms  = r.get("ocr_ms", 0)
+            total_ms += crop_ms + ocr_ms
             if hit:
                 matched += 1
                 color = "#56d364"
@@ -916,12 +775,16 @@ class TFTRollTool(QMainWindow):
             else:
                 color = "#c9650a"
                 tag   = "⚠ failed"
-            coord = f"[{reg[0]},{reg[1]} {reg[2]}×{reg[3]}]"
+            coord  = f"[{reg[0]},{reg[1]} {reg[2]}×{reg[3]}]"
+            timing = f"crop {crop_ms}ms | ocr {ocr_ms}ms"
             self._ocr_test_log.append(
                 f"<span style='color:{color};'>Slot {r['slot']}: {tag}</span>"
-                f"<span style='color:#444;font-size:9px;'>  {coord}</span>"
+                f"<span style='color:#444;font-size:9px;'>  {coord}  {timing}</span>"
             )
 
+        self._ocr_test_log.append(
+            f"<span style='color:#555;font-size:10px;'>─ total {total_ms:.0f} ms — {matched}/{len(results)} matched</span>"
+        )
         self._ocr_test_status.setText(
             f"Done — {matched} / {len(results)} slots matched above threshold."
         )
@@ -1001,11 +864,14 @@ class TFTRollTool(QMainWindow):
         )
         self._settings_status.setText(f"OCR test done — {total_ms:.0f} ms total.")
 
-    def _open_region_selector(self): pass
-    def _show_selector(self): pass
-    def _restore_window(self): pass
-    def _apply_saved_geometry(self): pass
-    def _on_region_selected(self, x, y, w, h): pass
+    def _apply_mode_preset(self):
+        """Apply Human or BOT timing presets to the spinboxes."""
+        if self._mode_human.isChecked():
+            self._shop_wait_sp.setValue(0.15)
+            self._buy_delay_sp.setValue(0.05)
+        else:
+            self._shop_wait_sp.setValue(0.10)
+            self._buy_delay_sp.setValue(0.005)
 
     def _save_settings(self):
         for i, (xs, ys) in enumerate(self._click_spins):
@@ -1017,11 +883,8 @@ class TFTRollTool(QMainWindow):
         self._settings_status.setText("✓ Settings saved.")
 
     def _reset_settings(self):
-        """Restore every settings widget to its built-in default value."""
-        self._roll_sp.setValue(1.5)
+        self._mode_human.setChecked(True)   # resets timing via _apply_mode_preset
         self._pre_sp.setValue(3)
-        self._shop_wait_sp.setValue(0.5)
-        self._buy_delay_sp.setValue(0.12)
         self._ocr_thr_sp.setValue(0.50)
 
         defaults_click = [
@@ -1091,13 +954,12 @@ class TFTRollTool(QMainWindow):
     def _start(self):
         self._log.clear()
         cfg = {
-            "roll_delay":    self._roll_sp.value(),
             "pre_delay":     self._pre_sp.value(),
             "shop_wait":     self._shop_wait_sp.value(),
             "buy_delay":     self._buy_delay_sp.value(),
             "ocr_threshold": self._ocr_thr_sp.value(),
             "auto_roll":     self._autoroll_cb.isChecked(),
-            "listen_d":      self._trigger_listen.isChecked(),
+            "bot_mode":      self._mode_bot.isChecked(),
             "wanted":        list(self._selected.keys()),
             "click_pos":     [list(p) for p in DEFAULTS["click_pos"]],
             "name_regions":  [list(r) for r in DEFAULTS["name_regions"]],
@@ -1109,12 +971,25 @@ class TFTRollTool(QMainWindow):
         self._worker.shop_signal.connect(self._on_shop)
         self._worker.finished.connect(self._on_done)
         self._worker.start()
+
+        self._esc_watcher = EscWatcher()
+        self._esc_watcher.triggered.connect(self._on_esc)
+        self._esc_watcher.start()
+
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+
+    def _on_esc(self):
+        if self._worker:
+            self._worker.stop("Stopped by ESC.")
+        if self._esc_watcher:
+            self._esc_watcher.stop()
 
     def _stop(self):
         if self._worker:
             self._worker.stop()
+        if self._esc_watcher:
+            self._esc_watcher.stop()
 
     def _toggle_overlay(self):
         if self._overlay.isVisible():
@@ -1150,16 +1025,20 @@ class TFTRollTool(QMainWindow):
             raw   = s.get("raw") or ""
             match = s["match"]
             cand  = s.get("best_candidate") or ""
+            t     = f"<span style='color:#444;font-size:9px;'>[{s['crop_ms']}+{s['ocr_ms']}ms]</span>"
             if match:
-                parts.append(f"<span style='color:#56d364;'>S{s['slot']} → <b>{match}</b> ✓</span>")
+                parts.append(f"<span style='color:#56d364;'>S{s['slot']} → <b>{match}</b> ✓</span>{t}")
             elif raw:
                 label = cand if cand else raw
-                parts.append(f"<span style='color:#555;'>S{s['slot']} → {label} ✗</span>")
+                parts.append(f"<span style='color:#555;'>S{s['slot']} → {label} ✗</span>{t}")
             else:
-                parts.append(f"<span style='color:#c9650a;'>S{s['slot']} ⚠ failed</span>")
+                parts.append(f"<span style='color:#c9650a;'>S{s['slot']} ⚠ failed</span>{t}")
         self._log.append("  ".join(parts))
 
     def _on_done(self):
+        if self._esc_watcher:
+            self._esc_watcher.stop()
+            self._esc_watcher = None
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._worker = None
@@ -1186,6 +1065,8 @@ class TFTRollTool(QMainWindow):
         """)
 
     def closeEvent(self, event):
+        if self._esc_watcher:
+            self._esc_watcher.stop(); self._esc_watcher.wait(500)
         if self._worker:
             self._worker.stop(); self._worker.wait(2000)
         self._overlay.close()
