@@ -748,6 +748,18 @@ class TFTRollTool(QMainWindow):
         )
         lay.addWidget(self._ocr_test_preview)
 
+        # ── Options row ───────────────────────────────────────
+        opt_row = QHBoxLayout()
+        self._ocr_test_use_hash_cb = QCheckBox("⚡ Use hash lookup first")
+        self._ocr_test_use_hash_cb.setChecked(True)
+        self._ocr_test_use_hash_cb.setToolTip(
+            "When checked, each slot is looked up in the hashmap before running Tesseract.\n"
+            "Hash hits are instant (⚡); only misses fall back to OCR."
+        )
+        opt_row.addWidget(self._ocr_test_use_hash_cb)
+        opt_row.addStretch()
+        lay.addLayout(opt_row)
+
         # ── Run button ────────────────────────────────────────
         run_btn = QPushButton("🔍  Run OCR")
         run_btn.setFixedHeight(34)
@@ -818,21 +830,26 @@ class TFTRollTool(QMainWindow):
         self._ocr_test_status.setText("Running OCR…")
         QApplication.processEvents()
 
-        regions = [list(r) for r in DEFAULTS["name_regions"]]
-        thr     = DEFAULTS["ocr_threshold"]
+        regions   = [list(r) for r in DEFAULTS["name_regions"]]
+        thr       = DEFAULTS["ocr_threshold"]
+        use_hash  = self._ocr_test_use_hash_cb.isChecked()
 
         try:
-            results = ocr_from_image_file(self._ocr_test_img_path, regions, thr)
+            if use_hash:
+                results = run_train_on_image(self._ocr_test_img_path, regions, thr)
+            else:
+                results = ocr_from_image_file(self._ocr_test_img_path, regions, thr)
         except Exception as e:
             self._ocr_test_status.setText(f"Error: {e}")
             return
 
         img_size = results[0]["img_size"] if results else ("?", "?")
+        mode_tag = "hash+OCR" if use_hash else "OCR only"
         self._ocr_test_log.clear()
         _hdr = (
             f"<span style='color:#ffd700;font-weight:bold;'>"
             f"[OCR Test] Image: {os.path.basename(self._ocr_test_img_path)}"
-            f"  ({img_size[0]}×{img_size[1]})"
+            f"  ({img_size[0]}×{img_size[1]})  [{mode_tag}]"
             f"</span>"
         )
         self._ocr_test_log.append(_hdr)
@@ -840,17 +857,19 @@ class TFTRollTool(QMainWindow):
         matched = 0
         total_ms = 0.0
         for r in results:
-            raw  = r.get("raw") or ""
-            cand = r.get("best_candidate") or ""
-            reg  = r["scaled_region"]
-            hit  = r["match"] is not None
+            raw     = r.get("raw") or ""
+            cand    = r.get("best_candidate") or ""
+            reg     = r["scaled_region"]
+            hit     = r["match"] is not None
+            src     = r.get("source", "ocr")
             crop_ms = r.get("crop_ms", 0)
             ocr_ms  = r.get("ocr_ms", 0)
             total_ms += crop_ms + ocr_ms
             if hit:
                 matched += 1
-                color = "#56d364"
-                tag   = f"→ <b>{r['match']}</b> ✓"
+                color   = "#56d364"
+                src_tag = "⚡" if src == "hash" else "🔬"
+                tag     = f"→ <b>{r['match']}</b> {src_tag} ✓"
             elif raw:
                 color = "#666"
                 label = cand if cand else raw
@@ -867,9 +886,23 @@ class TFTRollTool(QMainWindow):
             self._ocr_test_log.append(_line)
             self._olog(_line)
 
-        _summary = (
-            f"<span style='color:#555;font-size:10px;'>─ total {total_ms:.0f} ms — {matched}/{len(results)} matched</span>"
-        )
+        if use_hash:
+            hash_hits    = sum(1 for r in results if r.get("source") == "hash")
+            hash_ms      = sum(r.get("crop_ms", 0) for r in results if r.get("source") == "hash")
+            ocr_only_ms  = sum(
+                r.get("crop_ms", 0) + r.get("ocr_ms", 0)
+                for r in results if r.get("source") != "hash"
+            )
+            _summary = (
+                f"<span style='color:#555;font-size:10px;'>─ "
+                f"⚡{hash_hits}/5 {hash_ms:.0f}ms hash  |  "
+                f"🔬{5 - hash_hits}/5 {ocr_only_ms:.0f}ms ocr  |  "
+                f"{matched}/{len(results)} matched</span>"
+            )
+        else:
+            _summary = (
+                f"<span style='color:#555;font-size:10px;'>─ total {total_ms:.0f} ms — {matched}/{len(results)} matched</span>"
+            )
         self._ocr_test_log.append(_summary)
         self._olog(_summary)
         self._ocr_test_status.setText(
@@ -1386,6 +1419,22 @@ class TFTRollTool(QMainWindow):
                 _conflict_line = f"<span style='color:#ffa500;font-size:10px;'>⚠ {conflict}</span>"
                 self._train_log.append(_conflict_line)
                 self._olog(_conflict_line)
+
+        # Summary line
+        hash_hits   = sum(1 for r in results if r.get("source") == "hash")
+        hash_ms     = sum(r.get("crop_ms", 0) for r in results if r.get("source") == "hash")
+        ocr_only_ms = sum(
+            r.get("crop_ms", 0) + r.get("ocr_ms", 0)
+            for r in results if r.get("source") != "hash"
+        )
+        _summary = (
+            f"<span style='color:#444;font-size:10px;'>"
+            f"⚡ {hash_hits}/5 {hash_ms:.0f}ms hash  |  "
+            f"🔬 {5 - hash_hits}/5 {ocr_only_ms:.0f}ms ocr"
+            f"</span>"
+        )
+        self._train_log.append(_summary)
+        self._olog(_summary)
         self._train_log.append("")
 
     # ─────────────────────────────────────────────────────────

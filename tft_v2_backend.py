@@ -336,7 +336,11 @@ def ocr_all_slots_v2(name_regions: list, threshold: float) -> list[dict]:
     band_y0   = min(r[1] for r in name_regions) - pad
     band_x1   = max(r[0] + r[2] for r in name_regions)
     band_y1   = max(r[1] + r[3] for r in name_regions) + pad
-    full_rgb  = np.array(ImageGrab.grab(bbox=(band_x0, band_y0, band_x1, band_y1)))
+    try:
+        full_rgb = np.array(ImageGrab.grab(bbox=(band_x0, band_y0, band_x1, band_y1)))
+    except Exception as e:
+        print(f"[ocr_all_slots_v2] screen capture failed: {e}")
+        return []
     all_names = [n for names in TFT_UNITS.values() for n in names]
 
     def _slot(args):
@@ -546,22 +550,78 @@ class RollWorkerV2(QThread):
         count     = 0
         auto_roll = cfg.get("auto_roll", False)
         bot_mode  = cfg.get("bot_mode", False)
+        wanted    = set(cfg.get("wanted", []))
 
-        self.status_signal.emit(f"Starting in {cfg['pre_delay']}s – switch to TFT!")
+        # ── 1. Find TFT window ────────────────────────────────
+        self.status_signal.emit("Looking for TFT window…")
+        if not _focus_tft():
+            self.stop("⚠ TFT window not found. Is the game running?")
+            self.status_signal.emit(self._reason)
+            return
+
+        # ── 2. Pre-delay ──────────────────────────────────────
+        self.status_signal.emit(f"Found TFT — starting in {cfg['pre_delay']}s…")
         if self._sleep(cfg["pre_delay"]):
             self.status_signal.emit(self._reason)
             return
 
+        # ── 3. Focus TFT once before entering the loop ────────
+        if not _focus_tft():
+            self.stop("⚠ TFT window not found. Is the game running?")
+            self.status_signal.emit(self._reason)
+            return
+
         while self._running:
-            # ── ESC check at start of each loop ──────────────────
+            # ── ESC check ────────────────────────────────────
             if _esc_pressed():
                 self.stop("Stopped by ESC.")
                 break
-            # ── Trigger ──────────────────────────────────────────
-            if auto_roll:
-                if not _focus_tft():
-                    self.stop("⚠ TFT window not found. Is the game running?")
+
+            # ── 4. Scan (hash+OCR) ───────────────────────────
+            t0 = time.perf_counter()
+            if bot_mode:
+                fut = ThreadPoolExecutor(max_workers=1).submit(
+                    ocr_all_slots_v2, cfg["name_regions"], cfg["ocr_threshold"])
+                self._sleep(cfg["shop_wait"])
+                if not self._running:
                     break
+                results = fut.result()
+            else:
+                if self._sleep(cfg["shop_wait"]):
+                    break
+                results = ocr_all_slots_v2(cfg["name_regions"], cfg["ocr_threshold"])
+            self.shop_signal.emit(results)
+
+            # ── 5. Buy ───────────────────────────────────────
+            bought = []
+            for r, pos in zip(results, cfg["click_pos"]):
+                if not self._running:
+                    break
+                if r["match"] and r["match"] in wanted:
+                    _click(pos[0], pos[1])
+                    bought.append(r["match"])
+                    self.found_signal.emit(
+                        f"Slot {r['slot']} → {r['match']} ✓  ('{r['raw']}')")
+                    if self._sleep(cfg["buy_delay"]):
+                        break
+
+            if not self._running:
+                break
+
+            hash_hits   = sum(1 for r in results if r.get("source") == "hash")
+            hash_ms     = sum(r.get("crop_ms", 0) for r in results if r.get("source") == "hash")
+            ocr_only_ms = sum(
+                r.get("crop_ms", 0) + r.get("ocr_ms", 0)
+                for r in results if r.get("source") != "hash"
+            )
+            bought_str = ", ".join(bought) if bought else "none"
+            self.status_signal.emit(
+                f"Roll {count}  "
+                f"[⚡{hash_hits}/5 {hash_ms:.0f}ms | ocr {ocr_only_ms:.0f}ms]"
+                f"  |  bought: {bought_str}")
+
+            # ── 6. Roll ──────────────────────────────────────
+            if auto_roll:
                 _press("d")
                 count += 1
                 self.roll_signal.emit(count)
@@ -579,49 +639,6 @@ class RollWorkerV2(QThread):
                     break
                 count += 1
                 self.roll_signal.emit(count)
-                if not _focus_tft():
-                    self.stop("⚠ TFT window not found. Is the game running?")
-                    break
-
-            if not self._running:
-                break
-
-            # ── Hash+OCR (BOT: parallel with shop_wait) ───────────
-            t0 = time.perf_counter()
-            if bot_mode:
-                fut = ThreadPoolExecutor(max_workers=1).submit(
-                    ocr_all_slots_v2, cfg["name_regions"], cfg["ocr_threshold"])
-                self._sleep(cfg["shop_wait"])
-                if not self._running:
-                    break
-                results = fut.result()
-            else:
-                if self._sleep(cfg["shop_wait"]):
-                    break
-                results = ocr_all_slots_v2(cfg["name_regions"], cfg["ocr_threshold"])
-            ocr_ms = (time.perf_counter() - t0) * 1000
-            self.shop_signal.emit(results)
-
-            # ── Buy ──────────────────────────────────────────────
-            bought = []
-            for r, pos in zip(results, cfg["click_pos"]):
-                if not self._running:
-                    break
-                if r["match"]:
-                    _click(pos[0], pos[1])
-                    bought.append(r["match"])
-                    self.found_signal.emit(
-                        f"Slot {r['slot']} → {r['match']} ✓  ('{r['raw']}')")
-                    if self._sleep(cfg["buy_delay"]):
-                        break
-
-            if not self._running:
-                break
-
-            hash_hits  = sum(1 for r in results if r.get("source") == "hash")
-            bought_str = ", ".join(bought) if bought else "none"
-            self.status_signal.emit(
-                f"Roll {count}  [{ocr_ms:.0f}ms ⚡{hash_hits}/5]  |  bought: {bought_str}")
 
         self.status_signal.emit(self._reason)
 
