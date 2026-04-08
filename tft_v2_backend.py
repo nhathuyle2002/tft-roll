@@ -100,42 +100,60 @@ def compute_hash(normalized: np.ndarray) -> str:
 
 # ── HashMapper ─────────────────────────────────────────────────────────────────
 
+MAX_VARIANTS = 5  # max visual variants per slot+unit (1★/2★/3★, greyed out, etc.)
+
+
 class HashMapper:
     """
     Thread-safe store backed by hashmap_<w>_<h>.json (one file per resolution).
 
-    Storage format (JSON):  { "<slot>_<unit_name>": hash_value }  — sorted A→Z by key.
+    Storage format (JSON):  { "{slot}_{name}_{variant}": hash_value }  — sorted A→Z.
+    Each slot+name can have up to MAX_VARIANTS=5 hashes covering visual states such as
+    1-star, 2-star, 3-star, un-buyable (greyed), or other rendering variants.
     In-memory reverse index: { hash_value: unit_name }  — for O(1) roll-time lookup.
 
     update() rules:
-      • key not in map            → add, re-sort alphabetically, async save.
-      • key in map, same hash     → no-op.
-      • key in map, DIFF hash     → conflict: log warning, keep stored hash.
-        This catches normalisation drift between game patches or monitor settings.
+      • hash already in reverse index          → no-op (variant already known).
+      • score < 0.99                           → no write.
+      • variants for slot+name < MAX_VARIANTS  → add as next variant, async save.
+      • variants already at MAX_VARIANTS       → log and skip.
     """
 
     def __init__(self, path: Path):
         self._path:         Path             = path
-        self._key_to_hash:  dict[str, str]   = {}   # "{slot}_{name}" → hash, persisted
+        self._key_to_hash:  dict[str, str]   = {}   # "{slot}_{name}_{variant}" → hash, persisted
         self._hash_to_name: dict[str, str]   = {}   # hash → name, in-memory only
         self._lock = Lock()
         self.load()
 
     def load(self) -> int:
-        """Reload from disk, rebuild reverse index. Returns number of entries."""
+        """Reload from disk, rebuild reverse index, migrate old keys. Returns entry count."""
         if self._path.exists():
             try:
                 with open(self._path, "r", encoding="utf-8") as f:
                     data: dict[str, str] = json.load(f)
-                reverse: dict[str, str] = {}
+                # Migrate old format "{slot}_{name}" → "{slot}_{name}_0"
+                migrated: dict[str, str] = {}
                 for key, h in data.items():
-                    # key format: "1_Jinx" → name is everything after first "_"
-                    name = key.split("_", 1)[1] if "_" in key else key
+                    after_slot = key.split("_", 1)[1] if "_" in key else key
+                    parts = after_slot.rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) < MAX_VARIANTS:
+                        migrated[key] = h          # already new format
+                    else:
+                        migrated[f"{key}_0"] = h   # upgrade to variant 0
+                # Build reverse index: hash → name
+                reverse: dict[str, str] = {}
+                for key, h in migrated.items():
+                    # key: "1_Jinx_0" → strip slot prefix, then strip variant suffix
+                    after_slot = key.split("_", 1)[1] if "_" in key else key
+                    name = after_slot.rsplit("_", 1)[0] if "_" in after_slot else after_slot
                     reverse[h] = name
                 with self._lock:
-                    self._key_to_hash  = dict(data)
+                    self._key_to_hash  = dict(sorted(migrated.items()))
                     self._hash_to_name = reverse
-                return len(data)
+                if migrated != data:   # migration happened → persist immediately
+                    self.save()
+                return len(migrated)
             except Exception:
                 pass
         return 0
@@ -158,65 +176,68 @@ class HashMapper:
     def update(self, h: str, name: str, slot: int, score: float = 0.0,
                allow_overwrite: bool = True) -> tuple[str | None, bool]:
         """
-        Register a hash for a specific slot+name.
-        Key format: "{slot}_{name}"  e.g. "1_Jinx"
+        Register a hash as a visual variant of slot+name.
+        Key format: "{slot}_{name}_{variant}"  e.g. "1_Jinx_0", "1_Jinx_1" …
 
         Write rules:
-          New key AND score >= 0.99              → add new entry.
-          New key AND score <  0.99              → ignore (no write).
-          Existing key, different hash, allow_overwrite=True AND score >= 0.99 → overwrite.
-          otherwise                              → keep stored hash, return warning.
+          hash already in reverse index           → no-op (variant already known).
+          score < 0.99                            → no write.
+          used variants < MAX_VARIANTS            → add as next free variant, async save.
+          used variants == MAX_VARIANTS           → log and skip.
+
+        allow_overwrite is kept for API compatibility but has no effect: variants are
+        never overwritten, only appended.
 
         Returns (message, added) where:
-          message – conflict/overwrite description string, or None
-          added   – True if a new or overwritten entry was flushed to disk
+          message – warning string if max variants reached, otherwise None
+          added   – True if a new variant entry was written
         """
-        key      = f"{slot}_{name}"
-        changed  = False
-        conflict = None
+        if score < 0.99:
+            return None, False
+
+        prefix = f"{slot}_{name}_"
         with self._lock:
-            existing = self._key_to_hash.get(key)
-            if existing is None:
-                if score >= 0.99:
-                    # New entry — add and keep map sorted alphabetically
-                    self._key_to_hash[key] = h
-                    self._key_to_hash = dict(sorted(self._key_to_hash.items()))
-                    self._hash_to_name[h] = name
-                    changed = True
-            elif existing != h:
-                if allow_overwrite and score >= 0.99:
-                    # High-confidence new observation — overwrite stored hash
-                    old_h = existing
-                    self._key_to_hash[key] = h
-                    self._hash_to_name[h]  = name
-                    if old_h not in self._key_to_hash.values():
-                        self._hash_to_name.pop(old_h, None)
-                    changed  = True
-                    conflict = (
-                        f"[HashMapper] OVERWRITE '{key}': "
-                        f"old={existing[:8]} new={h[:8]} (score={score:.2f} ≥ 0.99)"
-                    )
-                else:
-                    # Keep stored hash
-                    conflict = (
-                        f"[HashMapper] CONFLICT '{key}': "
-                        f"stored={existing[:8]} new={h[:8]} (score={score:.2f}) — keeping stored."
-                    )
-            # existing == h → already known, no-op
-        if changed:
-            _async_pool.submit(self.save)
-        return conflict, changed
+            # Already a known hash → no-op regardless of slot/name
+            if h in self._hash_to_name:
+                return None, False
+
+            # Count existing variants for this slot+name
+            used = {k for k in self._key_to_hash if k.startswith(prefix)}
+            if len(used) >= MAX_VARIANTS:
+                conflict = (
+                    f"[HashMapper] MAX VARIANTS ({MAX_VARIANTS}) reached for "
+                    f"'{slot}_{name}': {h[:8]} — skipping."
+                )
+                return conflict, False
+
+            # Find the next free variant index (0, 1, 2, …)
+            for v in range(MAX_VARIANTS):
+                candidate = f"{prefix}{v}"
+                if candidate not in used:
+                    key = candidate
+                    break
+
+            self._key_to_hash[key] = h
+            self._key_to_hash = dict(sorted(self._key_to_hash.items()))
+            self._hash_to_name[h] = name
+
+        _async_pool.submit(self.save)
+        return None, True
 
     def remove(self, name: str, slot: int):
-        """Remove the entry for a specific slot+name."""
-        key = f"{slot}_{name}"
+        """Remove all variant entries for a specific slot+name."""
+        prefix = f"{slot}_{name}_"
         with self._lock:
-            h = self._key_to_hash.pop(key, None)
-            if h is not None:
-                # Only remove reverse index if no other slot has the same hash
-                if h not in self._key_to_hash.values():
-                    self._hash_to_name.pop(h, None)
-        _async_pool.submit(self.save)
+            keys_to_remove = [k for k in self._key_to_hash if k.startswith(prefix)]
+            removed_hashes: set[str] = set()
+            for key in keys_to_remove:
+                removed_hashes.add(self._key_to_hash.pop(key))
+            # Only drop reverse-index entries not referenced by any remaining key
+            for rh in removed_hashes:
+                if rh not in self._key_to_hash.values():
+                    self._hash_to_name.pop(rh, None)
+        if keys_to_remove:
+            _async_pool.submit(self.save)
 
     @property
     def size(self) -> int:
@@ -224,7 +245,7 @@ class HashMapper:
             return len(self._key_to_hash)
 
     def all_entries(self) -> list[tuple[str, str]]:
-        """Returns list of (key, hash) sorted alphabetically. key = '{slot}_{name}'."""
+        """Returns list of (key, hash) sorted alphabetically. key = '{slot}_{name}_{variant}'."""
         with self._lock:
             return list(self._key_to_hash.items())
 
