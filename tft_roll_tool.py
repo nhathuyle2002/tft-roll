@@ -826,12 +826,14 @@ class TFTRollTool(QMainWindow):
 
         img_size = results[0]["img_size"] if results else ("?", "?")
         self._ocr_test_log.clear()
-        self._ocr_test_log.append(
+        _hdr = (
             f"<span style='color:#ffd700;font-weight:bold;'>"
-            f"Image: {os.path.basename(self._ocr_test_img_path)}"
+            f"[OCR Test] Image: {os.path.basename(self._ocr_test_img_path)}"
             f"  ({img_size[0]}×{img_size[1]})"
             f"</span>"
         )
+        self._ocr_test_log.append(_hdr)
+        self._olog(_hdr)
         matched = 0
         total_ms = 0.0
         for r in results:
@@ -855,14 +857,18 @@ class TFTRollTool(QMainWindow):
                 tag   = "⚠ failed"
             coord  = f"[{reg[0]},{reg[1]} {reg[2]}×{reg[3]}]"
             timing = f"crop {crop_ms}ms | ocr {ocr_ms}ms"
-            self._ocr_test_log.append(
+            _line = (
                 f"<span style='color:{color};'>Slot {r['slot']}: {tag}</span>"
                 f"<span style='color:#444;font-size:9px;'>  {coord}  {timing}</span>"
             )
+            self._ocr_test_log.append(_line)
+            self._olog(_line)
 
-        self._ocr_test_log.append(
+        _summary = (
             f"<span style='color:#555;font-size:10px;'>─ total {total_ms:.0f} ms — {matched}/{len(results)} matched</span>"
         )
+        self._ocr_test_log.append(_summary)
+        self._olog(_summary)
         self._ocr_test_status.setText(
             f"Done — {matched} / {len(results)} slots matched above threshold."
         )
@@ -1087,10 +1093,14 @@ class TFTRollTool(QMainWindow):
         self._status_lbl.setText(msg)
         self._overlay.set_status(msg)
 
+    def _olog(self, html: str) -> None:
+        """Append html to the global log overlay (all tabs share it)."""
+        self._overlay.append_log(html)
+
     def _on_found(self, msg: str):
         html = f"<span style='color:#56d364;'>✓ {msg}</span>"
         self._log.append(html)
-        self._overlay.append_log(html)
+        self._olog(html)
 
     def _on_shop(self, results: list):
         self._overlay.append_shop_row(results)
@@ -1312,9 +1322,9 @@ class TFTRollTool(QMainWindow):
 
     def _train_append(self, results: list, header: str = ""):
         if header:
-            self._train_log.append(
-                f"<span style='color:#ffd700;font-weight:bold;'>{header}</span>"
-            )
+            _hdr = f"<span style='color:#ffd700;font-weight:bold;'>[Train] {header}</span>"
+            self._train_log.append(_hdr)
+            self._olog(_hdr)
         for r in results:
             src      = r.get("source", "?")
             match    = r["match"] or "—"
@@ -1335,16 +1345,18 @@ class TFTRollTool(QMainWindow):
             score_tag = (
                 f"<span style='color:{score_clr};font-weight:bold;'>{score:.2f}</span>"
             )
-            self._train_log.append(
+            _line = (
                 f"<span style='color:{clr};'>{icon} S{r['slot']} → {match}</span>"
                 f" score={score_tag}"
                 f" <span style='color:#8b949e;font-size:10px;'>"
                 f"[{t}] raw={r['raw']!r} h={h8}</span>"
             )
+            self._train_log.append(_line)
+            self._olog(_line)
             if conflict:
-                self._train_log.append(
-                    f"<span style='color:#ffa500;font-size:10px;'>⚠ {conflict}</span>"
-                )
+                _conflict_line = f"<span style='color:#ffa500;font-size:10px;'>⚠ {conflict}</span>"
+                self._train_log.append(_conflict_line)
+                self._olog(_conflict_line)
         self._train_log.append("")
 
     # ─────────────────────────────────────────────────────────
